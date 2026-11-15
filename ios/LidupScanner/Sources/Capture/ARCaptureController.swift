@@ -340,7 +340,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
         uiTelemetryTick += 1
         if (uiTelemetryTick % 8) == 0,
            let depthBuf = (frame.sceneDepth ?? frame.smoothedSceneDepth)?.depthMap {
-            centerDepthM = Png16Encoder.centerDepthMeters(from: depthBuf)
+            centerDepthM = DepthSnapshot.centerDepthMeters(from: depthBuf)
         }
 
         let (label, ready) = Self.describeTracking(frame.camera.trackingState)
