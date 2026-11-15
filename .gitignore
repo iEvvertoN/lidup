@@ -1,0 +1,22 @@
+# References (cloned external open-source repos for study)
+references/
+
+# Python / Processing
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+data/
+outputs/
+
+# Xcode / macOS
+.DS_Store
+*.xcuserstate
+xcuserdata/
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM

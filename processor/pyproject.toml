@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lidup"
+version = "0.1.0"
+description = "Processador topográfico e de terraplenagem rural para pacotes LiDAR/ARKit do iPhone (lidup_bundle_v1)."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "pyproj>=3.6",
+    "laspy[lazrs]>=2.5",
+    "open3d>=0.18",
+    "rasterio>=1.4",
+    "shapely>=2.0",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+lidup = "lidup.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
