@@ -183,12 +183,16 @@ final class BundleWriter: @unchecked Sendable {
             encodedJPEG = jpegData
         }
 
+        let finalJPEG = encodedJPEG
+        let finalImgW = imgW
+        let finalImgH = imgH
+
         writeQueue.async { [weak self] in
             guard let self else { return }
 
-            if encodedJPEG != nil && self.manifest.captureConfig.imageWidth == 0 {
-                self.manifest.captureConfig.imageWidth = imgW
-                self.manifest.captureConfig.imageHeight = imgH
+            if finalJPEG != nil && self.manifest.captureConfig.imageWidth == 0 {
+                self.manifest.captureConfig.imageWidth = finalImgW
+                self.manifest.captureConfig.imageHeight = finalImgH
                 if let depthSnapshot {
                     self.manifest.captureConfig.depthWidth = depthSnapshot.width
                     self.manifest.captureConfig.depthHeight = depthSnapshot.height
@@ -201,7 +205,7 @@ final class BundleWriter: @unchecked Sendable {
             }
 
             var relImage = ""
-            if let jpegData = encodedJPEG {
+            if let jpegData = finalJPEG {
                 relImage = "images/\(frameId).jpg"
                 let imgURL = self.bundleDirectory.appendingPathComponent(relImage)
                 do {
@@ -254,7 +258,7 @@ final class BundleWriter: @unchecked Sendable {
                 + "\(t.x),\(t.y),\(t.z),\(q.x),\(q.y),\(q.z),\(q.w),"
                 + "\(fx),\(fy),\(cx),\(cy),\(sharpness),\(trackingStateLabel),"
                 + "\(latStr),\(lonStr),\(altStr),\(hAccStr),\(vAccStr),"
-                + "\(dt.x),\(dt.y),\(dt.z),\(dq.x),\(dq.y),\(dq.z),\(dq.w),\(imgW),\(imgH)\n"
+                + "\(dt.x),\(dt.y),\(dt.z),\(dq.x),\(dq.y),\(dq.z),\(dq.w),\(finalImgW),\(finalImgH)\n"
 
             if let data = line.data(using: .utf8) {
                 try? self.framesHandle?.write(contentsOf: data)
@@ -305,43 +309,42 @@ final class BundleWriter: @unchecked Sendable {
             ))
         }
         guard !copies.isEmpty else { return }
+        let anchorCopies = copies
 
         writeQueue.async { [weak self] in
             guard let self else { return }
             var out = "# Lidup ARKit Mesh Reconstruction (mundo ARKit +Y cima)\n"
             var vertexBase = 1
 
-            for mesh in copies {
+            for mesh in anchorCopies {
                 mesh.vertexData.withUnsafeBytes { vRaw in
-                    guard let base = vRaw.baseAddress else { return }
                     for i in 0..<mesh.vertexCount {
                         let byteOff = mesh.vertexOffset + i * mesh.vertexStride
-                        guard byteOff + 12 <= mesh.vertexData.count else { break }
-                        let lx = base.advanced(by: byteOff).loadUnaligned(as: Float.self)
-                        let ly = base.advanced(by: byteOff + 4).loadUnaligned(as: Float.self)
-                        let lz = base.advanced(by: byteOff + 8).loadUnaligned(as: Float.self)
+                        guard byteOff + 12 <= vRaw.count else { break }
+                        let lx = vRaw.loadUnaligned(fromByteOffset: byteOff, as: Float.self)
+                        let ly = vRaw.loadUnaligned(fromByteOffset: byteOff + 4, as: Float.self)
+                        let lz = vRaw.loadUnaligned(fromByteOffset: byteOff + 8, as: Float.self)
                         let worldPos = mesh.transform * SIMD4<Float>(lx, ly, lz, 1.0)
                         out += String(format: "v %.5f %.5f %.5f\n", worldPos.x, worldPos.y, worldPos.z)
                     }
                 }
 
                 mesh.faceData.withUnsafeBytes { fRaw in
-                    guard let base = fRaw.baseAddress else { return }
                     for f in 0..<mesh.faceCount {
                         let triOffset = f * 3
                         if mesh.bytesPerIndex == 4 {
                             let byteOff = triOffset * 4
-                            guard byteOff + 12 <= mesh.faceData.count else { break }
-                            let i0 = Int(base.advanced(by: byteOff).loadUnaligned(as: UInt32.self)) + vertexBase
-                            let i1 = Int(base.advanced(by: byteOff + 4).loadUnaligned(as: UInt32.self)) + vertexBase
-                            let i2 = Int(base.advanced(by: byteOff + 8).loadUnaligned(as: UInt32.self)) + vertexBase
+                            guard byteOff + 12 <= fRaw.count else { break }
+                            let i0 = Int(fRaw.loadUnaligned(fromByteOffset: byteOff, as: UInt32.self)) + vertexBase
+                            let i1 = Int(fRaw.loadUnaligned(fromByteOffset: byteOff + 4, as: UInt32.self)) + vertexBase
+                            let i2 = Int(fRaw.loadUnaligned(fromByteOffset: byteOff + 8, as: UInt32.self)) + vertexBase
                             out += "f \(i0) \(i1) \(i2)\n"
                         } else if mesh.bytesPerIndex == 2 {
                             let byteOff = triOffset * 2
-                            guard byteOff + 6 <= mesh.faceData.count else { break }
-                            let i0 = Int(base.advanced(by: byteOff).loadUnaligned(as: UInt16.self)) + vertexBase
-                            let i1 = Int(base.advanced(by: byteOff + 2).loadUnaligned(as: UInt16.self)) + vertexBase
-                            let i2 = Int(base.advanced(by: byteOff + 4).loadUnaligned(as: UInt16.self)) + vertexBase
+                            guard byteOff + 6 <= fRaw.count else { break }
+                            let i0 = Int(fRaw.loadUnaligned(fromByteOffset: byteOff, as: UInt16.self)) + vertexBase
+                            let i1 = Int(fRaw.loadUnaligned(fromByteOffset: byteOff + 2, as: UInt16.self)) + vertexBase
+                            let i2 = Int(fRaw.loadUnaligned(fromByteOffset: byteOff + 4, as: UInt16.self)) + vertexBase
                             out += "f \(i0) \(i1) \(i2)\n"
                         }
                     }
