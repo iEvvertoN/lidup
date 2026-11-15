@@ -113,7 +113,7 @@ def test_export_3dgs_and_view_loaders(tmp_path: Path) -> None:
     assert len(np.asarray(geom_ply.points)) == info["point_count"]
     assert "PLY" in title_ply
 
-    geom_bundle, title_bundle = load_geometry_for_view(bundle_dir, min_confidence=2, voxel_size_m=0.1)
+    geom_bundle, title_bundle = load_geometry_for_view(bundle_dir, min_confidence=2, voxel_size_m=0.1, refine_poses=True)
     assert len(np.asarray(geom_bundle.points)) > 100
     assert "Bundle" in title_bundle
 

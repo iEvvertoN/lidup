@@ -46,6 +46,8 @@ def cmd_process(args: argparse.Namespace) -> None:
         min_confidence=args.min_confidence,
         max_depth_m=args.max_depth,
         voxel_size_m=args.voxel_size,
+        edge_jump_m=args.edge_jump,
+        refine_poses=args.refine_poses,
     )
     pts_arkit = np.asarray(pcd.points)
     rgb = np.asarray(pcd.colors) if pcd.has_colors() else None
@@ -195,9 +197,11 @@ def _resolve_view_target(target: Path) -> Path:
 def load_geometry_for_view(
     target: str | Path,
     *,
-    min_confidence: int = 1,
-    max_depth_m: float = 5.0,
+    min_confidence: int = 2,
+    max_depth_m: float = 4.5,
     voxel_size_m: float = 0.02,
+    edge_jump_m: float = 0.12,
+    refine_poses: bool = False,
 ) -> tuple[o3d.geometry.Geometry3D, str]:
     """Carrega uma nuvem (.ply/.laz), malha (.obj) ou bundle bruto `lidup_bundle_v1` para visualização 3D."""
     resolved = _resolve_view_target(Path(target))
@@ -209,6 +213,8 @@ def load_geometry_for_view(
             min_confidence=min_confidence,
             max_depth_m=max_depth_m,
             voxel_size_m=voxel_size_m,
+            edge_jump_m=edge_jump_m,
+            refine_poses=refine_poses,
         )
         pts = np.asarray(pcd.points, dtype=np.float64)
         if len(pts) == 0:
@@ -314,6 +320,8 @@ def cmd_view(args: argparse.Namespace) -> None:
         min_confidence=args.min_confidence,
         max_depth_m=args.max_depth,
         voxel_size_m=args.voxel_size,
+        edge_jump_m=args.edge_jump,
+        refine_poses=args.refine_poses,
     )
     print(f"[lidup] Abrindo visualizador 3D: {title}")
     print(
@@ -357,6 +365,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_proc.add_argument("--dtm-res", type=float, default=0.25, help="Resolução do raster MDT (m).")
     p_proc.add_argument("--contour-interval", type=float, default=0.5, help="Equidistância das curvas de nível (m).")
     p_proc.add_argument("--allow-gnss-scale", action="store_true", help="Permite ajustar escala pelo GNSS (usar só com RTK).")
+    p_proc.add_argument("--edge-jump", type=float, default=0.12, help="Remove saltos de profundidade em bordas acima deste limiar (m).")
+    p_proc.add_argument("--refine-poses", action="store_true", help="Refina alinhamento entre frames via ICP (útil para ambientes internos).")
     p_proc.add_argument("--with-3dgs", action="store_true", help="Gera também pasta gaussian_splatting (transforms.json + COLMAP).")
     p_proc.set_defaults(func=cmd_process)
 
@@ -382,9 +392,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_view = sub.add_parser("view", help="Abre janela 3D interativa para arquivo .ply/.laz/.obj, pasta de saída ou pacote bruto.")
     p_view.add_argument("target", help="Arquivo (.ply/.laz/.obj), pasta de saída ou pacote lidup_bundle_v1.")
-    p_view.add_argument("--min-confidence", type=int, default=1, choices=[0, 1, 2])
-    p_view.add_argument("--max-depth", type=float, default=5.0)
+    p_view.add_argument("--min-confidence", type=int, default=2, choices=[0, 1, 2])
+    p_view.add_argument("--max-depth", type=float, default=4.5)
     p_view.add_argument("--voxel-size", type=float, default=0.02)
+    p_view.add_argument("--edge-jump", type=float, default=0.12)
+    p_view.add_argument("--refine-poses", action="store_true", help="Realinha frames via ICP antes de exibir pacote bruto.")
     p_view.add_argument("--point-size", type=float, default=3.5)
     p_view.add_argument("--show-axes", action="store_true", help="Exibe eixos XYZ de referência.")
     p_view.set_defaults(func=cmd_view)

@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import open3d as o3d
 from PIL import Image
+from scipy.ndimage import maximum_filter, minimum_filter
 from scipy.spatial.transform import Rotation
 
 
@@ -31,6 +32,7 @@ class FrameRecord:
     alt_m: float | None
     h_acc_m: float | None
     v_acc_m: float | None
+    depth_t_wc: np.ndarray | None = None
 
 
 @dataclass
@@ -79,6 +81,18 @@ def load_bundle(bundle_dir: str | Path) -> LidupBundle:
             t_wc[:3, :3] = Rotation.from_quat(quat).as_matrix()
             t_wc[:3, 3] = [float(row["tx"]), float(row["ty"]), float(row["tz"])]
 
+            depth_t_wc: np.ndarray | None = None
+            if all(_opt_float(row.get(k)) is not None for k in ("depth_tx", "depth_ty", "depth_tz", "depth_qx", "depth_qy", "depth_qz", "depth_qw")):
+                depth_t_wc = np.eye(4, dtype=np.float64)
+                d_quat = [
+                    float(row["depth_qx"]),
+                    float(row["depth_qy"]),
+                    float(row["depth_qz"]),
+                    float(row["depth_qw"]),
+                ]
+                depth_t_wc[:3, :3] = Rotation.from_quat(d_quat).as_matrix()
+                depth_t_wc[:3, 3] = [float(row["depth_tx"]), float(row["depth_ty"]), float(row["depth_tz"])]
+
             frames.append(
                 FrameRecord(
                     frame_id=row["frame_id"].strip(),
@@ -98,6 +112,7 @@ def load_bundle(bundle_dir: str | Path) -> LidupBundle:
                     alt_m=_opt_float(row.get("alt_m")),
                     h_acc_m=_opt_float(row.get("h_acc_m")),
                     v_acc_m=_opt_float(row.get("v_acc_m")),
+                    depth_t_wc=depth_t_wc,
                 )
             )
 
@@ -112,10 +127,13 @@ def reconstruct_lidar_point_cloud(
     max_depth_m: float = 4.50,
     voxel_size_m: float = 0.03,
     frame_stride: int = 1,
+    edge_jump_m: float = 0.12,
+    refine_poses: bool = False,
 ) -> o3d.geometry.PointCloud:
     """
     Reconstrói a nuvem de pontos 3D no referencial local do ARKit a partir dos mapas
-    de profundidade LiDAR filtrados por confiança e coloridos pelas fotos RGB.
+    de profundidade LiDAR filtrados por confiança, descontinuidade de borda e coloridos
+    pelas fotos RGB (reprojetando quando a pose do depth diferir da foto 12 MP).
     """
     all_points: list[np.ndarray] = []
     all_colors: list[np.ndarray] = []
@@ -123,6 +141,9 @@ def reconstruct_lidar_point_cloud(
     cfg = bundle.manifest.get("capture_config", {})
     ref_img_w = int(cfg.get("image_width") or 0)
     ref_img_h = int(cfg.get("image_height") or 0)
+
+    icp_map: o3d.geometry.PointCloud | None = None
+    icp_voxel = max(0.02, float(voxel_size_m) if voxel_size_m > 0 else 0.02)
 
     for idx, frame in enumerate(bundle.frames):
         if idx % max(1, frame_stride) != 0:
@@ -147,12 +168,20 @@ def reconstruct_lidar_point_cloud(
                 if conf.shape == depth_m.shape:
                     mask &= conf >= min_confidence
 
+        if edge_jump_m > 0 and np.any(mask):
+            d_hi = maximum_filter(np.where(mask, depth_m, 0.0), size=3)
+            d_lo = minimum_filter(np.where(mask, depth_m, 1e6), size=3)
+            mask &= (d_hi - d_lo) <= edge_jump_m
+
         if not np.any(mask):
             continue
 
         rgb_arr: np.ndarray | None = None
         img_w = ref_img_w
         img_h = ref_img_h
+        pose_depth = frame.depth_t_wc if frame.depth_t_wc is not None else frame.t_wc
+        poses_differ = frame.depth_t_wc is not None and not np.allclose(frame.depth_t_wc, frame.t_wc, atol=1e-4)
+
         if frame.image_file:
             img_path = bundle.root / frame.image_file
             if img_path.exists():
@@ -181,15 +210,53 @@ def reconstruct_lidar_point_cloud(
         y = (v_idx.astype(np.float64) - cy) * z / fy
 
         cam_pts = np.stack([x, y, z], axis=1)
-        rot = frame.t_wc[:3, :3]
-        trans = frame.t_wc[:3, 3]
+        rot = pose_depth[:3, :3]
+        trans = pose_depth[:3, 3]
         world_pts = cam_pts @ rot.T + trans
-        all_points.append(world_pts)
 
         if rgb_arr is not None:
-            all_colors.append(rgb_arr[v_idx, u_idx])
+            if poses_differ:
+                # Reprojeta pontos 3D no instante exato da foto RGB para casar cor sem arrasto.
+                r_rgb = frame.t_wc[:3, :3]
+                t_rgb = frame.t_wc[:3, 3]
+                cam_rgb = (world_pts - t_rgb) @ r_rgb
+                z_rgb = cam_rgb[:, 2]
+                valid_rgb = z_rgb > 0.1
+                u_rgb = np.rint(fx * (cam_rgb[:, 0] / np.where(valid_rgb, z_rgb, 1.0)) + cx).astype(np.int64)
+                v_rgb = np.rint(fy * (cam_rgb[:, 1] / np.where(valid_rgb, z_rgb, 1.0)) + cy).astype(np.int64)
+                in_bounds = valid_rgb & (u_rgb >= 0) & (u_rgb < d_w) & (v_rgb >= 0) & (v_rgb < d_h)
+                frame_colors = np.full((len(world_pts), 3), 0.65, dtype=np.float64)
+                frame_colors[in_bounds] = rgb_arr[v_rgb[in_bounds], u_rgb[in_bounds]]
+            else:
+                frame_colors = rgb_arr[v_idx, u_idx]
         else:
-            all_colors.append(np.full((len(world_pts), 3), 0.65, dtype=np.float64))
+            frame_colors = np.full((len(world_pts), 3), 0.65, dtype=np.float64)
+
+        if refine_poses and len(world_pts) >= 150:
+            cur_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(world_pts))
+            cur_pcd.colors = o3d.utility.Vector3dVector(frame_colors)
+            if icp_map is None:
+                icp_map = cur_pcd.voxel_down_sample(icp_voxel)
+                icp_map.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=20))
+            else:
+                cur_ds = cur_pcd.voxel_down_sample(max(icp_voxel, 0.03))
+                if len(cur_ds.points) >= 80:
+                    cur_ds.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=20))
+                    reg = o3d.pipelines.registration.registration_icp(
+                        cur_ds,
+                        icp_map,
+                        0.22,
+                        np.eye(4),
+                        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    )
+                    if reg.fitness >= 0.35:
+                        cur_pcd.transform(reg.transformation)
+                        world_pts = np.asarray(cur_pcd.points)
+                icp_map = (icp_map + cur_pcd).voxel_down_sample(icp_voxel)
+                icp_map.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=20))
+
+        all_points.append(world_pts)
+        all_colors.append(frame_colors)
 
     pcd = o3d.geometry.PointCloud()
     if not all_points:

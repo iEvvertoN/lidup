@@ -131,16 +131,21 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
             config.sceneReconstruction = .mesh
         }
-        config.worldAlignment = .gravityAndHeading
+        // Em ambientes internos/3DGS evita desvios da bússola perto de metal e paredes; em campo aberto mantém norte magnético.
+        config.worldAlignment = (capturePreset == .object3DGS) ? .gravity : .gravityAndHeading
 
         arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
         applyOpticsLockIfNeeded(lock: lockCameraOptics)
     }
 
     func applyPreset(_ preset: CapturePreset) {
+        let alignmentChanged = (capturePreset != preset)
         capturePreset = preset
         minTranslationM = preset.minTranslationM
         minRotationDeg = preset.minRotationDeg
+        if alignmentChanged && !isRecording {
+            startARSession()
+        }
         lastStatusMessage = String(format: "Modo %@: %.2fm / %.0f°", preset.shortTitle, minTranslationM, minRotationDeg)
     }
 
@@ -327,11 +332,12 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
             return
         }
 
-        // Copia buffers pequenos (256x192) de imediato para não reter o `ARFrame` vivo na fila.
-        let depthSource = frame.smoothedSceneDepth ?? frame.sceneDepth
-        let depthSnapshot: DepthSnapshot? = depthSource.flatMap {
+        // Usa `sceneDepth` instantâneo do mesmo `ARFrame` e guarda sua pose exata `t0` para não dessincronizar ao girar.
+        let depthSourceT0 = frame.sceneDepth ?? frame.smoothedSceneDepth
+        let depthSnapshotT0: DepthSnapshot? = depthSourceT0.flatMap {
             DepthSnapshot.capture(from: $0.depthMap, confidenceMap: $0.confidenceMap)
         }
+        let depthTransformT0 = currentTransform
         let gnssSnapshot = locationProvider.latestSample
         let fallbackIntrinsics = frame.camera.intrinsics
         let fallbackTimestamp = frame.timestamp
@@ -345,13 +351,23 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
                 defer { self.isCapturingStill = false }
                 guard self.isRecording else { return }
 
-                let liveFallback = self.arSession.currentFrame
-                guard let chosenBuffer = hiResFrame?.capturedImage ?? liveFallback?.capturedImage else {
+                let liveNow = self.arSession.currentFrame
+                guard let chosenBuffer = hiResFrame?.capturedImage ?? liveNow?.capturedImage else {
                     return
                 }
-                let chosenTransform = hiResFrame?.camera.transform ?? currentTransform
-                let chosenIntrinsics = hiResFrame?.camera.intrinsics ?? fallbackIntrinsics
-                let chosenTimestamp = hiResFrame?.timestamp ?? fallbackTimestamp
+                let chosenTransform = hiResFrame?.camera.transform ?? liveNow?.camera.transform ?? currentTransform
+                let chosenIntrinsics = hiResFrame?.camera.intrinsics ?? liveNow?.camera.intrinsics ?? fallbackIntrinsics
+                let chosenTimestamp = hiResFrame?.timestamp ?? liveNow?.timestamp ?? fallbackTimestamp
+
+                var chosenDepth = depthSnapshotT0
+                var chosenDepthTransform = depthTransformT0
+                if let liveNow,
+                   abs(liveNow.timestamp - chosenTimestamp) < 0.045,
+                   let liveDepth = liveNow.sceneDepth ?? liveNow.smoothedSceneDepth,
+                   let freshDepth = DepthSnapshot.capture(from: liveDepth.depthMap, confidenceMap: liveDepth.confidenceMap) {
+                    chosenDepth = freshDepth
+                    chosenDepthTransform = liveNow.camera.transform
+                }
 
                 let sharpness = SharpnessMeter.score(chosenBuffer) ?? 0
                 if self.blurRejectionEnabled && self.savedFrameCount >= 5 {
@@ -373,10 +389,11 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
                     timestampS: chosenTimestamp,
                     pixelBuffer: chosenBuffer,
                     transform: chosenTransform,
+                    depthTransform: chosenDepthTransform,
                     intrinsics: chosenIntrinsics,
                     sharpness: sharpness,
                     trackingStateLabel: "normal",
-                    depthSnapshot: depthSnapshot,
+                    depthSnapshot: chosenDepth,
                     gnss: gnssSnapshot
                 )
             }

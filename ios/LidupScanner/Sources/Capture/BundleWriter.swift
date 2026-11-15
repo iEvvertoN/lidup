@@ -71,7 +71,7 @@ final class BundleWriter: @unchecked Sendable {
             gnssSource: "apple_core_location"
         )
 
-        let framesHeader = "frame_id,timestamp_s,image_file,depth_file,confidence_file,tx,ty,tz,qx,qy,qz,qw,fx,fy,cx,cy,sharpness,tracking_state,lat,lon,alt_m,h_acc_m,v_acc_m\n"
+        let framesHeader = "frame_id,timestamp_s,image_file,depth_file,confidence_file,tx,ty,tz,qx,qy,qz,qw,fx,fy,cx,cy,sharpness,tracking_state,lat,lon,alt_m,h_acc_m,v_acc_m,depth_tx,depth_ty,depth_tz,depth_qx,depth_qy,depth_qz,depth_qw\n"
         try framesHeader.write(to: framesURL, atomically: true, encoding: .utf8)
         self.framesHandle = try FileHandle(forWritingTo: framesURL)
         try self.framesHandle?.seekToEnd()
@@ -112,6 +112,7 @@ final class BundleWriter: @unchecked Sendable {
         timestampS: Double,
         pixelBuffer: CVPixelBuffer,
         transform: simd_float4x4,
+        depthTransform: simd_float4x4? = nil,
         intrinsics: simd_float3x3,
         sharpness: Float,
         trackingStateLabel: String,
@@ -178,6 +179,9 @@ final class BundleWriter: @unchecked Sendable {
 
             let t = transform.columns.3
             let q = (simd_quatf(transform) * Self.qAC).vector
+            let dTransform = depthTransform ?? transform
+            let dt = dTransform.columns.3
+            let dq = (simd_quatf(dTransform) * Self.qAC).vector
 
             let fx = intrinsics.columns.0.x
             let fy = intrinsics.columns.1.y
@@ -193,7 +197,8 @@ final class BundleWriter: @unchecked Sendable {
             let line = "\(frameId),\(String(format: "%.6f", timestampS)),\(relImage),\(relDepth),\(relConf),"
                 + "\(t.x),\(t.y),\(t.z),\(q.x),\(q.y),\(q.z),\(q.w),"
                 + "\(fx),\(fy),\(cx),\(cy),\(sharpness),\(trackingStateLabel),"
-                + "\(latStr),\(lonStr),\(altStr),\(hAccStr),\(vAccStr)\n"
+                + "\(latStr),\(lonStr),\(altStr),\(hAccStr),\(vAccStr),"
+                + "\(dt.x),\(dt.y),\(dt.z),\(dq.x),\(dq.y),\(dq.z),\(dq.w)\n"
 
             if let data = line.data(using: .utf8) {
                 try? self.framesHandle?.write(contentsOf: data)
