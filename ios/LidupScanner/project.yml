@@ -20,14 +20,13 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources
-    info:
-      path: Resources/Info.plist
     settings:
       base:
+        INFOPLIST_FILE: Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
         PRODUCT_BUNDLE_IDENTIFIER: com.lidup.scanner
         PRODUCT_NAME: LidupScanner
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
-        GENERATE_INFOPLIST_FILE: "NO"
     scheme:
       testTargets: []

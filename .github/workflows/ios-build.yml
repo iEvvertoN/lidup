@@ -39,6 +39,16 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build
 
+      - name: Verify Info.plist inside built app
+        working-directory: ios/LidupScanner
+        run: |
+          PLIST="build/Build/Products/Release-iphoneos/LidupScanner.app/Info.plist"
+          plutil -p "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :NSLocationWhenInUseUsageDescription" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :NSMotionUsageDescription" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :UIFileSharingEnabled" "$PLIST"
+
       - name: Package unsigned IPA for Sideloadly
         working-directory: ios/LidupScanner
         run: |
