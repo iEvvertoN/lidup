@@ -4,14 +4,51 @@ import AVFoundation
 import Combine
 import simd
 
+enum CapturePreset: String, CaseIterable, Identifiable {
+    case terrain = "terrain"
+    case object3DGS = "object_3dgs"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .terrain: return "Terreno Rural (5–7 ha)"
+        case .object3DGS: return "Objeto / Galpão (3DGS)"
+        }
+    }
+
+    var shortTitle: String {
+        switch self {
+        case .terrain: return "Terreno (0.8m)"
+        case .object3DGS: return "Objeto / 3DGS (0.25m)"
+        }
+    }
+
+    var minTranslationM: Float {
+        switch self {
+        case .terrain: return 0.80
+        case .object3DGS: return 0.25
+        }
+    }
+
+    var minRotationDeg: Float {
+        switch self {
+        case .terrain: return 12.0
+        case .object3DGS: return 8.0
+        }
+    }
+}
+
 /// Controla sessão ARKit + LiDAR, disparo espacial de fotos em alta resolução, filtro de nitidez e estacas GCP.
 @MainActor
 final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARSessionDelegate {
     @Published var sectorName: String = "galpao_norte"
+    @Published var capturePreset: CapturePreset = .terrain
     @Published var minTranslationM: Float = 0.80
     @Published var minRotationDeg: Float = 12.0
     @Published var lockCameraOptics: Bool = true
     @Published var blurRejectionEnabled: Bool = true
+    @Published var showLidarMeshOverlay: Bool = true
 
     @Published private(set) var isRecording: Bool = false
     @Published private(set) var savedFrameCount: Int = 0
@@ -20,6 +57,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
     @Published private(set) var trackingLabel: String = "Aguardando ARKit"
     @Published private(set) var trackingReady: Bool = false
     @Published private(set) var hasLidarSupport: Bool = false
+    @Published private(set) var hasMeshReconstructionSupport: Bool = false
     @Published private(set) var activeVideoResolution: String = "-"
     @Published private(set) var gcpPoints: [GCPPoint] = []
     @Published private(set) var scaleBars: [ScaleBar] = []
@@ -50,6 +88,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
         super.init()
         self.arSession.delegate = self
         self.hasLidarSupport = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+        self.hasMeshReconstructionSupport = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
 
         self.locationProvider.onSample = { [weak self] sample in
             Task { @MainActor [weak self] in
@@ -89,10 +128,20 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
             semantics.insert(.smoothedSceneDepth)
         }
         config.frameSemantics = semantics
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            config.sceneReconstruction = .mesh
+        }
         config.worldAlignment = .gravityAndHeading
 
         arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
         applyOpticsLockIfNeeded(lock: lockCameraOptics)
+    }
+
+    func applyPreset(_ preset: CapturePreset) {
+        capturePreset = preset
+        minTranslationM = preset.minTranslationM
+        minRotationDeg = preset.minRotationDeg
+        lastStatusMessage = String(format: "Modo %@: %.2fm / %.0f°", preset.shortTitle, minTranslationM, minRotationDeg)
     }
 
     func pauseARSession() {

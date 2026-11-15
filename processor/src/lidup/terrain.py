@@ -8,6 +8,7 @@ from typing import Any
 
 import laspy
 import numpy as np
+import open3d as o3d
 import rasterio
 from pyproj import CRS
 from rasterio.transform import Affine
@@ -310,6 +311,30 @@ def export_las_laz(
         las.classification = classification.astype(np.uint8)
 
     las.write(str(path))
+    return path
+
+
+def export_ply(
+    xyz: np.ndarray,
+    rgb: np.ndarray | None,
+    *,
+    out_path: str | Path,
+    origin: np.ndarray | None = None,
+) -> Path:
+    """Exporta nuvem de pontos colorida em PLY (centralizada em `origin` se fornecida)."""
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    pts = np.asarray(xyz, dtype=np.float64)
+    if origin is not None:
+        pts = pts - np.asarray(origin, dtype=np.float64)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    if rgb is not None and len(rgb) == len(pts):
+        pcd.colors = o3d.utility.Vector3dVector(np.clip(np.asarray(rgb, dtype=np.float64), 0.0, 1.0))
+
+    o3d.io.write_point_cloud(str(path), pcd)
     return path
 
 

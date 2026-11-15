@@ -17,8 +17,11 @@ struct CaptureView: View {
 
     var body: some View {
         ZStack {
-            ARPreviewContainer(session: controller.arSession)
-                .ignoresSafeArea()
+            ARPreviewContainer(
+                session: controller.arSession,
+                showMeshOverlay: controller.showLidarMeshOverlay
+            )
+            .ignoresSafeArea()
 
             VStack(spacing: 12) {
                 topStatusBar
@@ -84,6 +87,19 @@ struct CaptureView: View {
                         .background(.black.opacity(0.65), in: Capsule())
                 }
 
+                if controller.hasMeshReconstructionSupport {
+                    Button {
+                        controller.showLidarMeshOverlay.toggle()
+                    } label: {
+                        Image(systemName: controller.showLidarMeshOverlay ? "cube.transparent.fill" : "cube.transparent")
+                            .font(.body.bold())
+                            .foregroundStyle(controller.showLidarMeshOverlay ? .cyan : .white.opacity(0.75))
+                            .padding(8)
+                            .background(.black.opacity(0.65), in: Circle())
+                    }
+                    .accessibilityLabel("Alternar malha LiDAR")
+                }
+
                 Button {
                     showSettings = true
                 } label: {
@@ -142,6 +158,27 @@ struct CaptureView: View {
 
     private var bottomControls: some View {
         VStack(spacing: 12) {
+            if !controller.isRecording {
+                HStack(spacing: 8) {
+                    ForEach(CapturePreset.allCases) { preset in
+                        let selected = controller.capturePreset == preset
+                        Button {
+                            controller.applyPreset(preset)
+                        } label: {
+                            Text(preset.shortTitle)
+                                .font(.caption.bold())
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(
+                                    selected ? Color.cyan.opacity(0.85) : Color.black.opacity(0.65),
+                                    in: RoundedRectangle(cornerRadius: 10)
+                                )
+                                .foregroundStyle(selected ? .black : .white)
+                        }
+                    }
+                }
+            }
+
             if controller.isRecording {
                 HStack(spacing: 12) {
                     Button {
@@ -197,13 +234,26 @@ struct CaptureView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 }
+                Section("Modo de Captura") {
+                    Picker("Preset", selection: Binding(
+                        get: { controller.capturePreset },
+                        set: { controller.applyPreset($0) }
+                    )) {
+                        ForEach(CapturePreset.allCases) { preset in
+                            Text(preset.title).tag(preset)
+                        }
+                    }
+                    if controller.hasMeshReconstructionSupport {
+                        Toggle("Exibir malha LiDAR ao vivo", isOn: $controller.showLidarMeshOverlay)
+                    }
+                }
                 Section("Gatilho Espacial (ARKit)") {
                     HStack {
                         Text("Distância mínima")
                         Spacer()
                         Text(String(format: "%.2f m", controller.minTranslationM))
                     }
-                    Slider(value: $controller.minTranslationM, in: 0.3...2.5, step: 0.1)
+                    Slider(value: $controller.minTranslationM, in: 0.15...2.5, step: 0.05)
 
                     HStack {
                         Text("Rotação mínima")

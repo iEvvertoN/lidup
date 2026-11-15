@@ -6,8 +6,10 @@ from pathlib import Path
 import numpy as np
 
 from lidup.bundle import load_bundle, reconstruct_lidar_point_cloud
+from lidup.cli import load_geometry_for_view
 from lidup.earthwork import simulate_plateau_earthwork
 from lidup.georef import georeference_points, sirgas2000_utm_epsg, umeyama_alignment
+from lidup.gsplat import export_gaussian_splatting_dataset
 from lidup.synthetic import generate_synthetic_bundle
 from lidup.terrain import (
     build_dtm_raster,
@@ -15,6 +17,7 @@ from lidup.terrain import (
     compute_slope_percent,
     export_geotiff,
     export_las_laz,
+    export_ply,
     export_terrain_obj,
     extract_contours_geojson,
 )
@@ -74,9 +77,11 @@ def test_end_to_end_synthetic_bundle_and_earthwork(tmp_path: Path) -> None:
     assert len(contours["features"]) > 0
 
     laz_path = export_las_laz(pts_geo, np.asarray(pcd.colors), classes, epsg=geo.epsg, out_path=tmp_path / "out.laz")
+    ply_path = export_ply(pts_geo, np.asarray(pcd.colors), out_path=tmp_path / "cloud_local.ply", origin=geo.origin_utm)
     tif_path = export_geotiff(dtm.grid, dtm.transform, epsg=geo.epsg, out_path=tmp_path / "mdt.tif")
     obj_path = export_terrain_obj(dtm, origin_utm=geo.origin_utm, out_path=tmp_path / "terrain.obj")
     assert laz_path.exists() and laz_path.stat().st_size > 0
+    assert ply_path.exists() and ply_path.stat().st_size > 0
     assert tif_path.exists() and tif_path.stat().st_size > 0
     assert obj_path.exists() and "v " in obj_path.read_text(encoding="utf-8")
 
@@ -87,3 +92,27 @@ def test_end_to_end_synthetic_bundle_and_earthwork(tmp_path: Path) -> None:
     assert abs(report.cut_volume_m3 - report.fill_volume_m3) < 1e-3
     assert np.isfinite(graded.grid).any()
     json.dumps({"target_z": report.target_z_m})
+
+
+def test_export_3dgs_and_view_loaders(tmp_path: Path) -> None:
+    bundle_dir = generate_synthetic_bundle(tmp_path / "sample_3dgs", length_x_m=12.0, width_y_m=8.0)
+    gs_out = tmp_path / "gs_dataset"
+    info = export_gaussian_splatting_dataset(bundle_dir, gs_out, copy_images=True)
+
+    assert info["frame_count"] == 28
+    assert info["point_count"] > 100
+    transforms = json.loads((gs_out / "transforms.json").read_text(encoding="utf-8"))
+    assert len(transforms["frames"]) == 28
+    assert transforms["ply_file_path"] == "points3D.ply"
+    assert (gs_out / "points3D.ply").exists()
+    assert (gs_out / "sparse" / "0" / "cameras.txt").exists()
+    assert (gs_out / "sparse" / "0" / "images.txt").exists()
+    assert (gs_out / "sparse" / "0" / "points3D.txt").exists()
+
+    geom_ply, title_ply = load_geometry_for_view(gs_out / "points3D.ply")
+    assert len(np.asarray(geom_ply.points)) == info["point_count"]
+    assert "PLY" in title_ply
+
+    geom_bundle, title_bundle = load_geometry_for_view(bundle_dir, min_confidence=2, voxel_size_m=0.1)
+    assert len(np.asarray(geom_bundle.points)) > 100
+    assert "Bundle" in title_bundle

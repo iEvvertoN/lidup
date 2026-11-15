@@ -5,12 +5,15 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+import laspy
 import numpy as np
+import open3d as o3d
 import rasterio
 
 from .bundle import load_bundle, reconstruct_lidar_point_cloud
 from .earthwork import simulate_plateau_earthwork
-from .georef import georeference_points
+from .georef import arkit_to_engineering_local, georeference_points
+from .gsplat import export_gaussian_splatting_dataset
 from .synthetic import generate_synthetic_bundle
 from .terrain import (
     TerrainRaster,
@@ -19,6 +22,7 @@ from .terrain import (
     compute_slope_percent,
     export_geotiff,
     export_las_laz,
+    export_ply,
     export_terrain_obj,
     extract_contours_geojson,
     save_geojson,
@@ -59,6 +63,7 @@ def cmd_process(args: argparse.Namespace) -> None:
     print(f"[lidup] Classificação solo: {len(ground_pts)} solo / {len(pts_geo) - len(ground_pts)} não-solo")
 
     laz_path = export_las_laz(pts_geo, rgb, classes, epsg=geo.epsg, out_path=out_dir / "cloud.laz")
+    ply_path = export_ply(pts_geo, rgb, out_path=out_dir / "cloud_local.ply", origin=geo.origin_utm)
     dtm = build_dtm_raster(ground_pts, resolution_m=args.dtm_res)
     slope = compute_slope_percent(dtm)
 
@@ -67,6 +72,17 @@ def cmd_process(args: argparse.Namespace) -> None:
     contours = extract_contours_geojson(dtm, interval_m=args.contour_interval, epsg=geo.epsg)
     contours_path = save_geojson(contours, out_dir / "contours.geojson")
     obj_path = export_terrain_obj(dtm, origin_utm=geo.origin_utm, out_path=out_dir / "terrain_local.obj")
+
+    generated: list[Path] = [laz_path, ply_path, mdt_path, slope_path, contours_path, obj_path]
+    if args.with_3dgs:
+        gs_info = export_gaussian_splatting_dataset(
+            bundle,
+            out_dir / "gaussian_splatting",
+            min_confidence=min(args.min_confidence, 1),
+            max_depth_m=max(args.max_depth, 5.0),
+            voxel_size_m=min(args.voxel_size, 0.02),
+        )
+        generated.append(Path(gs_info["transforms_json"]))
 
     origin_info = {
         "epsg": geo.epsg,
@@ -84,9 +100,10 @@ def cmd_process(args: argparse.Namespace) -> None:
     }
     report_path = out_dir / "report.json"
     report_path.write_text(json.dumps(origin_info, indent=2), encoding="utf-8")
+    generated.append(report_path)
 
     print("[lidup] Arquivos gerados:")
-    for p in (laz_path, mdt_path, slope_path, contours_path, obj_path, report_path):
+    for p in generated:
         print(f"  - {p}")
 
 
@@ -145,6 +162,114 @@ def cmd_level(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_export_3dgs(args: argparse.Namespace) -> None:
+    info = export_gaussian_splatting_dataset(
+        args.bundle,
+        args.out,
+        min_confidence=args.min_confidence,
+        max_depth_m=args.max_depth,
+        voxel_size_m=args.voxel_size,
+        copy_images=args.copy_images,
+    )
+    print(f"[lidup] Dataset 3DGS exportado em: {info['out_dir']}")
+    print(f"  - Frames/câmeras: {info['frame_count']}")
+    print(f"  - Pontos iniciais LiDAR: {info['point_count']} ({info['points3d_ply']})")
+    print(f"  - Nerfstudio / Brush: {info['transforms_json']}")
+    print(f"  - COLMAP sparse: {info['colmap_sparse_dir']}")
+
+
+def _resolve_view_target(target: Path) -> Path:
+    if target.is_file():
+        return target
+    if not target.is_dir():
+        raise FileNotFoundError(f"Caminho não encontrado: {target}")
+    if (target / "manifest.json").exists():
+        return target
+    for candidate in ("cloud_local.ply", "cloud.ply", "points3D.ply", "cloud.laz", "cloud.las", "terrain_local.obj"):
+        p = target / candidate
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"Nenhum pacote lidup ou nuvem (.ply/.laz/.obj) encontrado em {target}")
+
+
+def load_geometry_for_view(
+    target: str | Path,
+    *,
+    min_confidence: int = 1,
+    max_depth_m: float = 5.0,
+    voxel_size_m: float = 0.02,
+) -> tuple[o3d.geometry.Geometry3D, str]:
+    """Carrega uma nuvem (.ply/.laz), malha (.obj) ou bundle bruto `lidup_bundle_v1` para visualização 3D."""
+    resolved = _resolve_view_target(Path(target))
+
+    if resolved.is_dir():
+        bundle = load_bundle(resolved)
+        pcd = reconstruct_lidar_point_cloud(
+            bundle,
+            min_confidence=min_confidence,
+            max_depth_m=max_depth_m,
+            voxel_size_m=voxel_size_m,
+        )
+        pts = np.asarray(pcd.points, dtype=np.float64)
+        if len(pts) == 0:
+            raise RuntimeError("Nenhum ponto válido encontrado para visualizar neste pacote.")
+        pts_eng = arkit_to_engineering_local(pts)
+        pts_eng -= pts_eng.mean(axis=0)
+        pcd.points = o3d.utility.Vector3dVector(pts_eng)
+        return pcd, f"Lidup Bundle ({bundle.manifest['session_id']} — {len(pts_eng)} pts)"
+
+    suffix = resolved.suffix.lower()
+    if suffix in {".laz", ".las"}:
+        las = laspy.read(str(resolved))
+        pts = np.asarray(las.xyz, dtype=np.float64)
+        if len(pts) == 0:
+            raise RuntimeError(f"Arquivo vazio: {resolved}")
+        pts = pts - pts.mean(axis=0)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        if hasattr(las, "red") and hasattr(las, "green") and hasattr(las, "blue"):
+            rgb = np.vstack([las.red, las.green, las.blue]).T.astype(np.float64) / 65535.0
+            pcd.colors = o3d.utility.Vector3dVector(np.clip(rgb, 0.0, 1.0))
+        return pcd, f"Lidup LAZ ({resolved.name} — {len(pts)} pts)"
+
+    if suffix == ".obj":
+        mesh = o3d.io.read_triangle_mesh(str(resolved))
+        mesh.compute_vertex_normals()
+        return mesh, f"Lidup OBJ ({resolved.name} — {len(mesh.vertices)} vértices)"
+
+    pcd = o3d.io.read_point_cloud(str(resolved))
+    pts = np.asarray(pcd.points, dtype=np.float64)
+    if len(pts) == 0:
+        raise RuntimeError(f"Nuvem vazia ou formato não suportado: {resolved}")
+    if np.max(np.abs(pts)) > 1000.0:
+        pcd.points = o3d.utility.Vector3dVector(pts - pts.mean(axis=0))
+    return pcd, f"Lidup PLY ({resolved.name} — {len(pts)} pts)"
+
+
+def cmd_view(args: argparse.Namespace) -> None:
+    geom, title = load_geometry_for_view(
+        args.target,
+        min_confidence=args.min_confidence,
+        max_depth_m=args.max_depth,
+        voxel_size_m=args.voxel_size,
+    )
+    print(f"[lidup] Abrindo visualizador 3D: {title}")
+    print("[lidup] Controles: Arrastar esquerdo = girar | Scroll = zoom | Shift+Arrastar = mover | +/- = tamanho dos pontos | Q = fechar")
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name=title, width=1280, height=800)
+    vis.add_geometry(geom)
+    if args.show_axes:
+        axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+        vis.add_geometry(axes)
+
+    opt = vis.get_render_option()
+    opt.background_color = np.asarray([0.08, 0.09, 0.11])
+    opt.point_size = float(args.point_size)
+    vis.run()
+    vis.destroy_window()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lidup", description="Processador topográfico rural para pacotes do iPhone.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -155,7 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sample.add_argument("--width", type=float, default=12.0, help="Largura Y em metros.")
     p_sample.set_defaults(func=cmd_make_sample)
 
-    p_proc = sub.add_parser("process", help="Processa um lidup_bundle_v1 em LAZ, MDT, curvas e OBJ.")
+    p_proc = sub.add_parser("process", help="Processa um lidup_bundle_v1 em LAZ, PLY, MDT, curvas e OBJ.")
     p_proc.add_argument("bundle", help="Pasta do pacote lidup_bundle_v1.")
     p_proc.add_argument("--out", required=True, help="Pasta de saída dos produtos.")
     p_proc.add_argument("--min-confidence", type=int, default=2, choices=[0, 1, 2], help="Confiança mínima do LiDAR.")
@@ -166,6 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_proc.add_argument("--dtm-res", type=float, default=0.25, help="Resolução do raster MDT (m).")
     p_proc.add_argument("--contour-interval", type=float, default=0.5, help="Equidistância das curvas de nível (m).")
     p_proc.add_argument("--allow-gnss-scale", action="store_true", help="Permite ajustar escala pelo GNSS (usar só com RTK).")
+    p_proc.add_argument("--with-3dgs", action="store_true", help="Gera também pasta gaussian_splatting (transforms.json + COLMAP).")
     p_proc.set_defaults(func=cmd_process)
 
     p_lvl = sub.add_parser("level", help="Simula nivelamento de platô e calcula corte/aterro em m³.")
@@ -178,6 +304,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_lvl.add_argument("--local", action="store_true", help="Coordenadas relativas ao origin_utm do report.json.")
     p_lvl.add_argument("--target-z", type=float, default=None, help="Cota fixa desejada (omete para calcular equilíbrio corte=aterro).")
     p_lvl.set_defaults(func=cmd_level)
+
+    p_gs = sub.add_parser("export-3dgs", help="Exporta dataset (transforms.json + COLMAP + points3D.ply) para Gaussian Splatting.")
+    p_gs.add_argument("bundle", help="Pasta do pacote lidup_bundle_v1.")
+    p_gs.add_argument("--out", required=True, help="Pasta de destino do dataset 3DGS.")
+    p_gs.add_argument("--min-confidence", type=int, default=1, choices=[0, 1, 2])
+    p_gs.add_argument("--max-depth", type=float, default=6.0)
+    p_gs.add_argument("--voxel-size", type=float, default=0.02)
+    p_gs.add_argument("--copy-images", action="store_true", help="Copia fotos em vez de criar hardlinks.")
+    p_gs.set_defaults(func=cmd_export_3dgs)
+
+    p_view = sub.add_parser("view", help="Abre janela 3D interativa para arquivo .ply/.laz/.obj, pasta de saída ou pacote bruto.")
+    p_view.add_argument("target", help="Arquivo (.ply/.laz/.obj), pasta de saída ou pacote lidup_bundle_v1.")
+    p_view.add_argument("--min-confidence", type=int, default=1, choices=[0, 1, 2])
+    p_view.add_argument("--max-depth", type=float, default=5.0)
+    p_view.add_argument("--voxel-size", type=float, default=0.02)
+    p_view.add_argument("--point-size", type=float, default=3.5)
+    p_view.add_argument("--show-axes", action="store_true", help="Exibe eixos XYZ de referência.")
+    p_view.set_defaults(func=cmd_view)
 
     return parser
 
