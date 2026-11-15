@@ -20,21 +20,21 @@ enum CapturePreset: String, CaseIterable, Identifiable {
     var shortTitle: String {
         switch self {
         case .terrain: return "Terreno (0.8m)"
-        case .object3DGS: return "Objeto / 3DGS (0.25m)"
+        case .object3DGS: return "Objeto (0.12m)"
         }
     }
 
     var minTranslationM: Float {
         switch self {
         case .terrain: return 0.80
-        case .object3DGS: return 0.25
+        case .object3DGS: return 0.12
         }
     }
 
     var minRotationDeg: Float {
         switch self {
         case .terrain: return 12.0
-        case .object3DGS: return 8.0
+        case .object3DGS: return 5.0
         }
     }
 }
@@ -49,11 +49,16 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
     @Published var lockCameraOptics: Bool = true
     @Published var blurRejectionEnabled: Bool = true
     @Published var showLidarMeshOverlay: Bool = true
+    @Published var imuStabilizedCapture: Bool = true
+    @Published var highDensityDepthEnabled: Bool = true
 
     @Published private(set) var isRecording: Bool = false
     @Published private(set) var savedFrameCount: Int = 0
+    @Published private(set) var savedDepthOnlyCount: Int = 0
     @Published private(set) var rejectedBlurCount: Int = 0
     @Published private(set) var walkedDistanceM: Float = 0
+    @Published private(set) var centerDepthM: Float?
+    @Published private(set) var angularSpeedDegS: Float = 0
     @Published private(set) var trackingLabel: String = "Aguardando ARKit"
     @Published private(set) var trackingReady: Bool = false
     @Published private(set) var hasLidarSupport: Bool = false
@@ -70,9 +75,14 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
 
     let arSession = ARSession()
     let locationProvider: CoreLocationProvider
+    let motionProvider = MotionProvider()
 
     private var writer: BundleWriter?
     private var lastKeyframeTransform: simd_float4x4?
+    private var lastDepthBurstTransform: simd_float4x4?
+    private var lastDepthBurstTimestamp: TimeInterval = 0
+    private var pendingHiResSince: TimeInterval?
+    private var uiTelemetryTick: Int = 0
     private var lastTrackedPosition: SIMD3<Float>?
     private var latestCameraTransform: simd_float4x4?
     private var isCapturingStill = false
@@ -90,6 +100,12 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
         self.hasLidarSupport = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
         self.hasMeshReconstructionSupport = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
 
+        self.motionProvider.onMetrics = { [weak self] gyroRadS in
+            Task { @MainActor [weak self] in
+                self?.angularSpeedDegS = gyroRadS * (180.0 / .pi)
+            }
+        }
+
         self.locationProvider.onSample = { [weak self] sample in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -106,6 +122,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
 
     func startARSession() {
         locationProvider.startUpdating()
+        motionProvider.startUpdating()
 
         guard ARWorldTrackingConfiguration.isSupported else {
             trackingLabel = "ARKit não suportado neste dispositivo"
@@ -152,6 +169,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
     func pauseARSession() {
         arSession.pause()
         locationProvider.stopUpdating()
+        motionProvider.stopUpdating()
     }
 
     func toggleRecording() {
@@ -183,15 +201,20 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
                 hasLidar: hasLidarSupport
             )
             savedFrameCount = 0
+            savedDepthOnlyCount = 0
             rejectedBlurCount = 0
             walkedDistanceM = 0
             frameCounter = 0
             bestSharpness = 0
             lastKeyframeTransform = nil
+            lastDepthBurstTransform = nil
+            lastDepthBurstTimestamp = 0
+            pendingHiResSince = nil
             lastTrackedPosition = nil
             gcpPoints = []
             scaleBars = []
             isRecording = true
+            motionProvider.setIMUWriter(writer)
             applyOpticsLockIfNeeded(lock: lockCameraOptics)
             lastStatusMessage = "Gravação iniciada em \(writer?.sessionId ?? "")"
         } catch {
@@ -201,11 +224,14 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
 
     func stopRecording() {
         isRecording = false
+        motionProvider.setIMUWriter(nil)
         gcpTask?.cancel()
         isCollectingGCP = false
 
         guard let currentWriter = writer else { return }
         writer = nil
+        let meshAnchors = arSession.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+        currentWriter.saveARMeshAnchors(meshAnchors)
         currentWriter.finish { [weak self] in
             Task { @MainActor [weak self] in
                 self?.lastStatusMessage = "Pacote salvo: \(currentWriter.sessionId)"
@@ -311,6 +337,12 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         latestCameraTransform = frame.camera.transform
 
+        uiTelemetryTick += 1
+        if (uiTelemetryTick % 8) == 0,
+           let depthBuf = (frame.sceneDepth ?? frame.smoothedSceneDepth)?.depthMap {
+            centerDepthM = Png16Encoder.centerDepthMeters(from: depthBuf)
+        }
+
         let (label, ready) = Self.describeTracking(frame.camera.trackingState)
         trackingLabel = label
         trackingReady = ready
@@ -327,92 +359,147 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
         }
         lastTrackedPosition = currentPos
 
-        guard !isCapturingStill else { return }
-        if let lastT = lastKeyframeTransform, !hasMovedEnough(from: lastT, to: currentTransform) {
+        let hiResDue: Bool = {
+            guard let lastT = lastKeyframeTransform else { return true }
+            return hasMovedEnough(from: lastT, to: currentTransform, minDist: minTranslationM, minAngleDeg: minRotationDeg)
+        }()
+
+        // Disparo tipo micro-drone: se o usuário está no meio de um giro rápido, aguarda até 160ms pelo vale do giroscópio.
+        var shouldTriggerHiRes = !isCapturingStill && hiResDue
+        if shouldTriggerHiRes && imuStabilizedCapture && lastKeyframeTransform != nil {
+            let gyro = motionProvider.latestAngularSpeedRadS
+            if gyro > 0.35 {
+                if let since = pendingHiResSince {
+                    if (frame.timestamp - since) < 0.16 {
+                        shouldTriggerHiRes = false
+                    }
+                } else {
+                    pendingHiResSince = frame.timestamp
+                    shouldTriggerHiRes = false
+                }
+            }
+        }
+
+        if shouldTriggerHiRes {
+            pendingHiResSince = nil
+            // Usa `sceneDepth` instantâneo do mesmo `ARFrame` e guarda sua pose exata `t0` para não dessincronizar ao girar.
+            let depthSourceT0 = frame.sceneDepth ?? frame.smoothedSceneDepth
+            let depthSnapshotT0: DepthSnapshot? = depthSourceT0.flatMap {
+                DepthSnapshot.capture(from: $0.depthMap, confidenceMap: $0.confidenceMap)
+            }
+            let depthTransformT0 = currentTransform
+            let gnssSnapshot = locationProvider.latestSample
+            let fallbackIntrinsics = frame.camera.intrinsics
+            let fallbackTimestamp = frame.timestamp
+
+            lastKeyframeTransform = currentTransform
+            lastDepthBurstTransform = currentTransform
+            lastDepthBurstTimestamp = frame.timestamp
+            isCapturingStill = true
+
+            session.captureHighResolutionFrame { [weak self] hiResFrame, _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    defer { self.isCapturingStill = false }
+                    guard self.isRecording else { return }
+
+                    let liveNow = self.arSession.currentFrame
+                    guard let chosenBuffer = hiResFrame?.capturedImage ?? liveNow?.capturedImage else {
+                        return
+                    }
+                    let chosenTransform = hiResFrame?.camera.transform ?? liveNow?.camera.transform ?? currentTransform
+                    let chosenIntrinsics = hiResFrame?.camera.intrinsics ?? liveNow?.camera.intrinsics ?? fallbackIntrinsics
+                    let chosenTimestamp = hiResFrame?.timestamp ?? liveNow?.timestamp ?? fallbackTimestamp
+
+                    var chosenDepth = depthSnapshotT0
+                    var chosenDepthTransform = depthTransformT0
+                    if let liveNow,
+                       abs(liveNow.timestamp - chosenTimestamp) < 0.045,
+                       let liveDepth = liveNow.sceneDepth ?? liveNow.smoothedSceneDepth,
+                       let freshDepth = DepthSnapshot.capture(from: liveDepth.depthMap, confidenceMap: liveDepth.confidenceMap) {
+                        chosenDepth = freshDepth
+                        chosenDepthTransform = liveNow.camera.transform
+                    }
+
+                    let sharpness = SharpnessMeter.score(chosenBuffer) ?? 0
+                    if self.blurRejectionEnabled && self.savedFrameCount >= 5 {
+                        if self.bestSharpness > 0 && sharpness < self.bestSharpness * 0.45 {
+                            self.rejectedBlurCount += 1
+                            return
+                        }
+                    }
+                    if sharpness > self.bestSharpness {
+                        self.bestSharpness = sharpness
+                    }
+
+                    let idx = self.frameCounter
+                    self.frameCounter += 1
+                    self.savedFrameCount += 1
+
+                    activeWriter.appendKeyframe(
+                        frameIndex: idx,
+                        timestampS: chosenTimestamp,
+                        pixelBuffer: chosenBuffer,
+                        transform: chosenTransform,
+                        depthTransform: chosenDepthTransform,
+                        intrinsics: chosenIntrinsics,
+                        sharpness: sharpness,
+                        trackingStateLabel: "normal",
+                        depthSnapshot: chosenDepth,
+                        gnss: gnssSnapshot
+                    )
+                }
+            }
             return
         }
 
-        // Usa `sceneDepth` instantâneo do mesmo `ARFrame` e guarda sua pose exata `t0` para não dessincronizar ao girar.
-        let depthSourceT0 = frame.sceneDepth ?? frame.smoothedSceneDepth
-        let depthSnapshotT0: DepthSnapshot? = depthSourceT0.flatMap {
-            DepthSnapshot.capture(from: $0.depthMap, confidenceMap: $0.confidenceMap)
-        }
-        let depthTransformT0 = currentTransform
-        let gnssSnapshot = locationProvider.latestSample
-        let fallbackIntrinsics = frame.camera.intrinsics
-        let fallbackTimestamp = frame.timestamp
+        // Burst contínuo somente de LiDAR entre fotos 12 MP (multiplica densidade sem pesar nos JPEGs).
+        if highDensityDepthEnabled,
+           (frame.timestamp - lastDepthBurstTimestamp) >= 0.14,
+           let lastDepthT = lastDepthBurstTransform,
+           hasMovedEnough(
+               from: lastDepthT,
+               to: currentTransform,
+               minDist: max(0.05, minTranslationM * 0.45),
+               minAngleDeg: max(2.5, minRotationDeg * 0.50)
+           ),
+           let depthSource = frame.sceneDepth ?? frame.smoothedSceneDepth,
+           let depthSnapshot = DepthSnapshot.capture(from: depthSource.depthMap, confidenceMap: depthSource.confidenceMap) {
+            let idx = frameCounter
+            frameCounter += 1
+            savedDepthOnlyCount += 1
+            lastDepthBurstTransform = currentTransform
+            lastDepthBurstTimestamp = frame.timestamp
 
-        lastKeyframeTransform = currentTransform
-        isCapturingStill = true
-
-        session.captureHighResolutionFrame { [weak self] hiResFrame, _ in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                defer { self.isCapturingStill = false }
-                guard self.isRecording else { return }
-
-                let liveNow = self.arSession.currentFrame
-                guard let chosenBuffer = hiResFrame?.capturedImage ?? liveNow?.capturedImage else {
-                    return
-                }
-                let chosenTransform = hiResFrame?.camera.transform ?? liveNow?.camera.transform ?? currentTransform
-                let chosenIntrinsics = hiResFrame?.camera.intrinsics ?? liveNow?.camera.intrinsics ?? fallbackIntrinsics
-                let chosenTimestamp = hiResFrame?.timestamp ?? liveNow?.timestamp ?? fallbackTimestamp
-
-                var chosenDepth = depthSnapshotT0
-                var chosenDepthTransform = depthTransformT0
-                if let liveNow,
-                   abs(liveNow.timestamp - chosenTimestamp) < 0.045,
-                   let liveDepth = liveNow.sceneDepth ?? liveNow.smoothedSceneDepth,
-                   let freshDepth = DepthSnapshot.capture(from: liveDepth.depthMap, confidenceMap: liveDepth.confidenceMap) {
-                    chosenDepth = freshDepth
-                    chosenDepthTransform = liveNow.camera.transform
-                }
-
-                let sharpness = SharpnessMeter.score(chosenBuffer) ?? 0
-                if self.blurRejectionEnabled && self.savedFrameCount >= 5 {
-                    if self.bestSharpness > 0 && sharpness < self.bestSharpness * 0.45 {
-                        self.rejectedBlurCount += 1
-                        return
-                    }
-                }
-                if sharpness > self.bestSharpness {
-                    self.bestSharpness = sharpness
-                }
-
-                let idx = self.frameCounter
-                self.frameCounter += 1
-                self.savedFrameCount += 1
-
-                activeWriter.appendKeyframe(
-                    frameIndex: idx,
-                    timestampS: chosenTimestamp,
-                    pixelBuffer: chosenBuffer,
-                    transform: chosenTransform,
-                    depthTransform: chosenDepthTransform,
-                    intrinsics: chosenIntrinsics,
-                    sharpness: sharpness,
-                    trackingStateLabel: "normal",
-                    depthSnapshot: chosenDepth,
-                    gnss: gnssSnapshot
-                )
-            }
+            activeWriter.appendKeyframe(
+                frameIndex: idx,
+                timestampS: frame.timestamp,
+                pixelBuffer: nil,
+                imageSizeHint: frame.camera.imageResolution,
+                transform: currentTransform,
+                depthTransform: currentTransform,
+                intrinsics: frame.camera.intrinsics,
+                sharpness: 0,
+                trackingStateLabel: "normal",
+                depthSnapshot: depthSnapshot,
+                gnss: locationProvider.latestSample
+            )
         }
     }
 
     // MARK: - Helpers
 
-    private func hasMovedEnough(from previous: simd_float4x4, to current: simd_float4x4) -> Bool {
+    private func hasMovedEnough(from previous: simd_float4x4, to current: simd_float4x4, minDist: Float, minAngleDeg: Float) -> Bool {
         let p0 = SIMD3<Float>(previous.columns.3.x, previous.columns.3.y, previous.columns.3.z)
         let p1 = SIMD3<Float>(current.columns.3.x, current.columns.3.y, current.columns.3.z)
-        if simd_distance(p0, p1) >= minTranslationM {
+        if simd_distance(p0, p1) >= minDist {
             return true
         }
 
         let f0 = simd_normalize(-SIMD3<Float>(previous.columns.2.x, previous.columns.2.y, previous.columns.2.z))
         let f1 = simd_normalize(-SIMD3<Float>(current.columns.2.x, current.columns.2.y, current.columns.2.z))
         let cosine = max(-1.0 as Float, min(1.0 as Float, simd_dot(f0, f1)))
-        let minRotRad = minRotationDeg * .pi / 180.0
+        let minRotRad = minAngleDeg * .pi / 180.0
         return acos(cosine) >= minRotRad
     }
 

@@ -85,6 +85,76 @@ def umeyama_alignment(
     return scale, rot, trans
 
 
+def gravity_locked_yaw_alignment(
+    src_arkit: np.ndarray,
+    dst: np.ndarray,
+    *,
+    allow_scale: bool = False,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """
+    Alinha pontos ARKit a coordenadas topográficas/UTM preservando 100% o vetor gravidade da IMU.
+    Ajusta apenas rotação horizontal (Yaw em torno de Z) e translação XY, usando a mediana
+    para o deslocamento vertical (dZ) para não entortar declividades pelo ruído de altitude do GPS.
+    """
+    if src_arkit.shape != dst.shape or src_arkit.ndim != 2 or src_arkit.shape[1] != 3:
+        raise ValueError("src_arkit e dst devem ter shape (N, 3)")
+    n = src_arkit.shape[0]
+    if n < 2:
+        raise ValueError("São necessários pelo menos 2 pontos para alinhamento horizontal")
+
+    src_eng = arkit_to_engineering_local(src_arkit)
+    src_xy = src_eng[:, :2]
+    dst_xy = dst[:, :2]
+
+    mu_s = src_xy.mean(axis=0)
+    mu_d = dst_xy.mean(axis=0)
+    src_c = src_xy - mu_s
+    dst_c = dst_xy - mu_d
+
+    cov2 = (dst_c.T @ src_c) / float(n)
+    u2, singular_vals, vt2 = np.linalg.svd(cov2)
+    d2 = np.eye(2, dtype=np.float64)
+    if np.linalg.det(u2) * np.linalg.det(vt2) < 0:
+        d2[1, 1] = -1.0
+    rot2 = u2 @ d2 @ vt2
+
+    if allow_scale:
+        var_s = float(np.sum(src_c ** 2) / float(n))
+        scale = float(np.sum(singular_vals * np.diag(d2)) / max(var_s, 1e-12))
+    else:
+        scale = 1.0
+
+    rot_yaw = np.eye(3, dtype=np.float64)
+    rot_yaw[:2, :2] = rot2
+    rot = rot_yaw @ _arkit_to_eng_matrix()
+
+    t_xy = mu_d - scale * (rot2 @ mu_s)
+    t_z = float(np.median(dst[:, 2] - scale * src_eng[:, 2]))
+    trans = np.array([float(t_xy[0]), float(t_xy[1]), t_z], dtype=np.float64)
+    return scale, rot, trans
+
+
+def _fit_and_score_alignment(
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+    *,
+    pre_scale: float,
+    allow_scale: bool,
+    lock_gravity: bool,
+) -> tuple[float, np.ndarray, np.ndarray, tuple[float, float, float], float]:
+    scaled_src = src_pts * pre_scale
+    if lock_gravity:
+        scale_u, rot, trans = gravity_locked_yaw_alignment(scaled_src, dst_pts, allow_scale=allow_scale)
+    else:
+        scale_u, rot, trans = umeyama_alignment(scaled_src, dst_pts, allow_scale=allow_scale)
+    total_scale = pre_scale * scale_u
+    aligned = (src_pts * total_scale) @ rot.T + trans
+    err = aligned - dst_pts
+    rmse_xyz = tuple(float(np.sqrt(np.mean(err[:, i] ** 2))) for i in range(3))
+    rmse_total = float(np.sqrt(np.mean(np.sum(err ** 2, axis=1))))
+    return total_scale, rot, trans, rmse_xyz, rmse_total
+
+
 def compute_scale_from_bars(gcps: dict[str, Any]) -> float | None:
     """Estima fator de escala métrica a partir de medidas de trena entre estacas registradas no ARKit."""
     points_by_id = {p["id"]: np.array(p["arkit_xyz"], dtype=np.float64) for p in gcps.get("points", [])}
@@ -131,12 +201,35 @@ def georeference_points(
     bundle: LidupBundle,
     *,
     allow_gnss_scale: bool = False,
+    lock_gravity: bool = True,
+    force_local: bool = False,
 ) -> tuple[np.ndarray, GeorefResult]:
     """
     Transforma pontos do mundo ARKit para coordenadas projetadas (SIRGAS 2000 / UTM) ou
-    local topográfico (Z para cima) quando não há GNSS suficiente.
+    local topográfico (Z para cima) quando não há GNSS suficiente ou `force_local=True`.
     """
     bar_scale = compute_scale_from_bars(bundle.gcps)
+
+    if force_local:
+        scale = bar_scale if bar_scale is not None else 1.0
+        rot = _arkit_to_eng_matrix()
+        eng_pts = (points_arkit * scale) @ rot.T
+        origin = eng_pts.mean(axis=0)
+        return eng_pts, GeorefResult(
+            epsg=0,
+            crs_name="LOCAL_ENGINEERING_METERS",
+            mode="local_only",
+            scale=scale,
+            rotation=rot,
+            translation=np.zeros(3, dtype=np.float64),
+            origin_utm=origin,
+            rmse_xyz_m=None,
+            rmse_total_m=None,
+            control_points_used=0,
+            notes="Modo local métrico forçado (gravidade ARKit preservada, GNSS ignorado).",
+        )
+
+    align_label = "gravidade travada (Yaw+XY+dZ)" if lock_gravity else "3D livre (Umeyama)"
 
     # 1. Tenta usar estacas/GCPs estacionários de `gcps.json`
     gcp_candidates = [
@@ -160,19 +253,15 @@ def georeference_points(
             dtype=np.float64,
         )
 
-        # Se houver trena, pré-escala pontos ARKit antes de ajustar rotação+translação rígida
+        # Se houver trena, pré-escala pontos ARKit antes de ajustar rotação+translação
         pre_scale = bar_scale if bar_scale is not None else 1.0
-        scale_u, rot, trans = umeyama_alignment(
-            src_pts * pre_scale,
+        total_scale, rot, trans, rmse_xyz, rmse_total = _fit_and_score_alignment(
+            src_pts,
             dst_pts,
+            pre_scale=pre_scale,
             allow_scale=(allow_gnss_scale and bar_scale is None),
+            lock_gravity=lock_gravity,
         )
-        total_scale = pre_scale * scale_u
-
-        aligned_gcp = (src_pts * total_scale) @ rot.T + trans
-        err = aligned_gcp - dst_pts
-        rmse_xyz = tuple(float(np.sqrt(np.mean(err[:, i] ** 2))) for i in range(3))
-        rmse_total = float(np.sqrt(np.mean(np.sum(err ** 2, axis=1))))
 
         utm_pts = (points_arkit * total_scale) @ rot.T + trans
         origin = utm_pts.mean(axis=0)
@@ -187,7 +276,7 @@ def georeference_points(
             rmse_xyz_m=rmse_xyz,
             rmse_total_m=rmse_total,
             control_points_used=len(gcp_candidates),
-            notes="Alinhamento 3D via estacas estacionárias (gcps.json)"
+            notes=f"Alinhamento {align_label} via estacas estacionárias (gcps.json)"
             + (" com escala calibrada por trena." if bar_scale else "."),
         )
 
@@ -208,20 +297,17 @@ def georeference_points(
             dtype=np.float64,
         )
 
-        # Só faz alinhamento 3D se o trajeto teve espalhamento mínimo (>= 3 m)
+        # Só faz alinhamento GNSS se o trajeto teve espalhamento mínimo (>= 3 m)
         span = float(np.linalg.norm(src_pts.max(axis=0) - src_pts.min(axis=0)))
         if span >= 3.0:
             pre_scale = bar_scale if bar_scale is not None else 1.0
-            scale_u, rot, trans = umeyama_alignment(
-                src_pts * pre_scale,
+            total_scale, rot, trans, rmse_xyz, rmse_total = _fit_and_score_alignment(
+                src_pts,
                 dst_pts,
+                pre_scale=pre_scale,
                 allow_scale=(allow_gnss_scale and bar_scale is None),
+                lock_gravity=lock_gravity,
             )
-            total_scale = pre_scale * scale_u
-            aligned = (src_pts * total_scale) @ rot.T + trans
-            err = aligned - dst_pts
-            rmse_xyz = tuple(float(np.sqrt(np.mean(err[:, i] ** 2))) for i in range(3))
-            rmse_total = float(np.sqrt(np.mean(np.sum(err ** 2, axis=1))))
 
             utm_pts = (points_arkit * total_scale) @ rot.T + trans
             origin = utm_pts.mean(axis=0)
@@ -236,7 +322,7 @@ def georeference_points(
                 rmse_xyz_m=rmse_xyz,
                 rmse_total_m=rmse_total,
                 control_points_used=len(gnss_frames),
-                notes="Alinhamento 3D via GNSS dos keyframes (sem estacas estacionárias suficientes).",
+                notes=f"Alinhamento {align_label} via GNSS dos keyframes (sem estacas estacionárias suficientes).",
             )
 
     # 3. Fallback local: apenas corrige eixos (Z para cima) + escala de trena se houver

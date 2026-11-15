@@ -72,6 +72,23 @@ struct GNSSSample: Codable, Sendable {
     let source: String
 }
 
+struct IMUSample: Sendable {
+    let timestampS: Double
+    let gx: Double
+    let gy: Double
+    let gz: Double
+    let ax: Double
+    let ay: Double
+    let az: Double
+    let gravX: Double
+    let gravY: Double
+    let gravZ: Double
+    let qx: Double
+    let qy: Double
+    let qz: Double
+    let qw: Double
+}
+
 struct GCPPoint: Codable, Identifiable {
     let id: String
     let kind: String

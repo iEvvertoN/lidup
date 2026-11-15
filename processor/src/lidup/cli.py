@@ -10,7 +10,7 @@ import numpy as np
 import open3d as o3d
 import rasterio
 
-from .bundle import load_bundle, reconstruct_lidar_point_cloud
+from .bundle import load_bundle, reconstruct_lidar_point_cloud, reconstruct_tsdf_mesh
 from .earthwork import simulate_plateau_earthwork
 from .georef import arkit_to_engineering_local, georeference_points
 from .gsplat import export_gaussian_splatting_dataset
@@ -41,26 +41,61 @@ def cmd_process(args: argparse.Namespace) -> None:
     bundle = load_bundle(args.bundle)
     print(f"[lidup] Pacote carregado: {bundle.manifest['session_id']} ({len(bundle.frames)} frames)")
 
-    pcd = reconstruct_lidar_point_cloud(
-        bundle,
-        min_confidence=args.min_confidence,
-        max_depth_m=args.max_depth,
-        voxel_size_m=args.voxel_size,
-        edge_jump_m=args.edge_jump,
-        refine_poses=args.refine_poses,
-    )
+    max_inc = None if (args.max_incidence_deg is None or args.max_incidence_deg <= 0 or args.max_incidence_deg >= 90) else float(args.max_incidence_deg)
+    tsdf_mesh: o3d.geometry.TriangleMesh | None = None
+    if args.tsdf:
+        upsample = args.depth_upsample if args.depth_upsample is not None else 2
+        pcd, tsdf_mesh = reconstruct_tsdf_mesh(
+            bundle,
+            min_confidence=args.min_confidence,
+            max_depth_m=args.max_depth,
+            tsdf_voxel_m=args.tsdf_voxel,
+            edge_jump_m=args.edge_jump,
+            refine_poses=(args.pose_refine != "none") if args.pose_refine else True,
+            pose_refine=args.pose_refine,
+            max_incidence_deg=max_inc,
+            hires_color=True,
+            depth_upsample=upsample,
+            focus_radius_m=args.tsdf_focus_radius,
+        )
+    else:
+        upsample = args.depth_upsample if args.depth_upsample is not None else 1
+        pcd = reconstruct_lidar_point_cloud(
+            bundle,
+            min_confidence=args.min_confidence,
+            max_depth_m=args.max_depth,
+            voxel_size_m=args.voxel_size,
+            edge_jump_m=args.edge_jump,
+            refine_poses=args.refine_poses,
+            pose_refine=args.pose_refine,
+            max_incidence_deg=max_inc,
+            physics_weight=not args.no_physics_weight,
+            hires_color=args.hires_color,
+            depth_upsample=upsample,
+        )
     pts_arkit = np.asarray(pcd.points)
     rgb = np.asarray(pcd.colors) if pcd.has_colors() else None
     if len(pts_arkit) == 0:
         raise RuntimeError("Nenhum ponto válido encontrado após filtragem de confiança/profundidade.")
     print(f"[lidup] Nuvem LiDAR filtrada: {len(pts_arkit)} pontos")
 
-    pts_geo, geo = georeference_points(pts_arkit, bundle, allow_gnss_scale=args.allow_gnss_scale)
+    pts_geo, geo = georeference_points(
+        pts_arkit,
+        bundle,
+        allow_gnss_scale=args.allow_gnss_scale,
+        lock_gravity=(args.georef_alignment != "free_3d"),
+        force_local=(args.georef_alignment == "local"),
+    )
     print(f"[lidup] Georreferenciamento: mode={geo.mode} | CRS={geo.crs_name} (EPSG:{geo.epsg}) | scale={geo.scale:.5f}")
     if geo.rmse_total_m is not None:
         print(f"[lidup] RMSE controle: total={geo.rmse_total_m:.3f}m | xyz={geo.rmse_xyz_m}")
 
-    classes = classify_ground_points(pts_geo, cell_size_m=args.ground_cell, max_height_above_ground_m=args.ground_thresh)
+    classes = classify_ground_points(
+        pts_geo,
+        cell_size_m=args.ground_cell,
+        max_height_above_ground_m=args.ground_thresh,
+        method=args.ground_method,
+    )
     ground_pts = pts_geo[classes == 2]
     print(f"[lidup] Classificação solo: {len(ground_pts)} solo / {len(pts_geo) - len(ground_pts)} não-solo")
 
@@ -76,6 +111,14 @@ def cmd_process(args: argparse.Namespace) -> None:
     obj_path = export_terrain_obj(dtm, origin_utm=geo.origin_utm, out_path=out_dir / "terrain_local.obj")
 
     generated: list[Path] = [laz_path, ply_path, mdt_path, slope_path, contours_path, obj_path]
+    if tsdf_mesh is not None and len(tsdf_mesh.vertices) > 0:
+        verts_arkit = np.asarray(tsdf_mesh.vertices, dtype=np.float64)
+        verts_local = (verts_arkit * geo.scale) @ geo.rotation.T + geo.translation - geo.origin_utm
+        tsdf_mesh.vertices = o3d.utility.Vector3dVector(verts_local)
+        tsdf_mesh.compute_vertex_normals()
+        mesh_path = out_dir / "object_mesh_local.ply"
+        o3d.io.write_triangle_mesh(str(mesh_path), tsdf_mesh)
+        generated.append(mesh_path)
     if args.with_3dgs:
         gs_info = export_gaussian_splatting_dataset(
             bundle,
@@ -187,7 +230,7 @@ def _resolve_view_target(target: Path) -> Path:
         raise FileNotFoundError(f"Caminho não encontrado: {target}")
     if (target / "manifest.json").exists():
         return target
-    for candidate in ("cloud_local.ply", "cloud.ply", "points3D.ply", "cloud.laz", "cloud.las", "terrain_local.obj"):
+    for candidate in ("object_mesh_local.ply", "cloud_local.ply", "cloud.ply", "points3D.ply", "cloud.laz", "cloud.las", "terrain_local.obj"):
         p = target / candidate
         if p.exists():
             return p
@@ -202,12 +245,44 @@ def load_geometry_for_view(
     voxel_size_m: float = 0.02,
     edge_jump_m: float = 0.12,
     refine_poses: bool = False,
+    pose_refine: str | None = None,
+    max_incidence_deg: float | None = 75.0,
+    physics_weight: bool = True,
+    use_tsdf: bool = False,
+    tsdf_voxel_m: float = 0.008,
+    hires_color: bool = False,
+    depth_upsample: int | None = None,
+    tsdf_focus_radius_m: float | None = None,
 ) -> tuple[o3d.geometry.Geometry3D, str]:
-    """Carrega uma nuvem (.ply/.laz), malha (.obj) ou bundle bruto `lidup_bundle_v1` para visualização 3D."""
+    """Carrega uma nuvem (.ply/.laz), malha (.ply/.obj) ou bundle bruto `lidup_bundle_v1` para visualização 3D."""
     resolved = _resolve_view_target(Path(target))
 
     if resolved.is_dir():
         bundle = load_bundle(resolved)
+        if use_tsdf:
+            upsample = depth_upsample if depth_upsample is not None else 2
+            _, mesh = reconstruct_tsdf_mesh(
+                bundle,
+                min_confidence=min_confidence,
+                max_depth_m=max_depth_m,
+                tsdf_voxel_m=tsdf_voxel_m,
+                edge_jump_m=edge_jump_m,
+                refine_poses=refine_poses or (pose_refine not in {None, "none"}),
+                pose_refine=pose_refine,
+                max_incidence_deg=max_incidence_deg,
+                hires_color=True,
+                depth_upsample=upsample,
+                focus_radius_m=tsdf_focus_radius_m,
+            )
+            verts = np.asarray(mesh.vertices, dtype=np.float64)
+            if len(verts) == 0:
+                raise RuntimeError("Nenhum vértice reconstruído via TSDF neste pacote.")
+            verts_eng = arkit_to_engineering_local(verts)
+            verts_eng -= verts_eng.mean(axis=0)
+            mesh.vertices = o3d.utility.Vector3dVector(verts_eng)
+            mesh.compute_vertex_normals()
+            return mesh, f"Lidup TSDF ({bundle.manifest['session_id']} — {len(verts_eng)} vértices)"
+        upsample = depth_upsample if depth_upsample is not None else 1
         pcd = reconstruct_lidar_point_cloud(
             bundle,
             min_confidence=min_confidence,
@@ -215,6 +290,11 @@ def load_geometry_for_view(
             voxel_size_m=voxel_size_m,
             edge_jump_m=edge_jump_m,
             refine_poses=refine_poses,
+            pose_refine=pose_refine,
+            max_incidence_deg=max_incidence_deg,
+            physics_weight=physics_weight,
+            hires_color=hires_color,
+            depth_upsample=upsample,
         )
         pts = np.asarray(pcd.points, dtype=np.float64)
         if len(pts) == 0:
@@ -242,6 +322,15 @@ def load_geometry_for_view(
         mesh = o3d.io.read_triangle_mesh(str(resolved))
         mesh.compute_vertex_normals()
         return mesh, f"Lidup OBJ ({resolved.name} — {len(mesh.vertices)} vértices)"
+
+    if suffix == ".ply":
+        mesh_try = o3d.io.read_triangle_mesh(str(resolved))
+        if len(mesh_try.triangles) > 0 and len(mesh_try.vertices) > 0:
+            v = np.asarray(mesh_try.vertices, dtype=np.float64)
+            if np.max(np.abs(v)) > 1000.0:
+                mesh_try.vertices = o3d.utility.Vector3dVector(v - v.mean(axis=0))
+            mesh_try.compute_vertex_normals()
+            return mesh_try, f"Lidup Mesh ({resolved.name} — {len(v)} vértices)"
 
     pcd = o3d.io.read_point_cloud(str(resolved))
     pts = np.asarray(pcd.points, dtype=np.float64)
@@ -315,6 +404,7 @@ def configure_view_controls(
 
 
 def cmd_view(args: argparse.Namespace) -> None:
+    max_inc = None if (args.max_incidence_deg is None or args.max_incidence_deg <= 0 or args.max_incidence_deg >= 90) else float(args.max_incidence_deg)
     geom, title = load_geometry_for_view(
         args.target,
         min_confidence=args.min_confidence,
@@ -322,6 +412,14 @@ def cmd_view(args: argparse.Namespace) -> None:
         voxel_size_m=args.voxel_size,
         edge_jump_m=args.edge_jump,
         refine_poses=args.refine_poses,
+        pose_refine=args.pose_refine,
+        max_incidence_deg=max_inc,
+        physics_weight=not args.no_physics_weight,
+        use_tsdf=args.tsdf,
+        tsdf_voxel_m=args.tsdf_voxel,
+        hires_color=(args.hires_color or args.tsdf),
+        depth_upsample=args.depth_upsample,
+        tsdf_focus_radius_m=args.tsdf_focus_radius,
     )
     print(f"[lidup] Abrindo visualizador 3D: {title}")
     print(
@@ -366,7 +464,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_proc.add_argument("--contour-interval", type=float, default=0.5, help="Equidistância das curvas de nível (m).")
     p_proc.add_argument("--allow-gnss-scale", action="store_true", help="Permite ajustar escala pelo GNSS (usar só com RTK).")
     p_proc.add_argument("--edge-jump", type=float, default=0.12, help="Remove saltos de profundidade em bordas acima deste limiar (m).")
-    p_proc.add_argument("--refine-poses", action="store_true", help="Refina alinhamento entre frames via ICP (útil para ambientes internos).")
+    p_proc.add_argument("--max-incidence-deg", type=float, default=75.0, help="Remove raios LiDAR em ângulo rasante acima deste limite em graus (90 = desativado).")
+    p_proc.add_argument("--no-physics-weight", action="store_true", help="Desativa ponderação cos(theta)/z^2 na redução por voxel.")
+    p_proc.add_argument("--refine-poses", action="store_true", help="Refina poses entre frames via PoseGraph + Loop Closure (use --pose-refine para trocar o método).")
+    p_proc.add_argument("--pose-refine", default=None, choices=["none", "posegraph", "colored_icp", "legacy_icp"], help="Método de alinhamento entre frames (padrão: posegraph quando --refine-poses ativo).")
+    p_proc.add_argument("--tsdf", action="store_true", help="Gera malha 3D sólida contínua (UniformTSDFVolume) com textura 12 MP (ideal para objetos/interiores).")
+    p_proc.add_argument("--tsdf-voxel", type=float, default=0.008, help="Tamanho do voxel da malha TSDF em metros (padrão: 0.008 = 8 mm).")
+    p_proc.add_argument("--tsdf-focus-radius", type=float, default=None, help="Raio (m) ao redor do centro de convergência das câmeras 360° para concentrar o voxel fino no objeto.")
+    p_proc.add_argument("--depth-upsample", type=int, default=None, choices=[1, 2, 3], help="Super-resolução de profundidade guiada por bordas RGB (padrão: 2 com --tsdf, 1 na nuvem esparsa).")
+    p_proc.add_argument("--hires-color", action="store_true", help="Projeta cores diretamente das fotos 12 MP em vez de 256x192.")
+    p_proc.add_argument("--georef-alignment", default="gravity_locked", choices=["gravity_locked", "free_3d", "local"], help="Alinhamento GNSS: gravidade travada (padrão), 3D livre legado ou local.")
+    p_proc.add_argument("--ground-method", default="csf", choices=["csf", "percentile"], help="Método de classificação de solo: CSF físico (padrão) ou percentil.")
     p_proc.add_argument("--with-3dgs", action="store_true", help="Gera também pasta gaussian_splatting (transforms.json + COLMAP).")
     p_proc.set_defaults(func=cmd_process)
 
@@ -396,7 +504,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_view.add_argument("--max-depth", type=float, default=4.5)
     p_view.add_argument("--voxel-size", type=float, default=0.02)
     p_view.add_argument("--edge-jump", type=float, default=0.12)
-    p_view.add_argument("--refine-poses", action="store_true", help="Realinha frames via ICP antes de exibir pacote bruto.")
+    p_view.add_argument("--max-incidence-deg", type=float, default=75.0)
+    p_view.add_argument("--no-physics-weight", action="store_true")
+    p_view.add_argument("--refine-poses", action="store_true", help="Realinha frames via PoseGraph antes de exibir pacote bruto.")
+    p_view.add_argument("--pose-refine", default=None, choices=["none", "posegraph", "colored_icp", "legacy_icp"])
+    p_view.add_argument("--tsdf", action="store_true", help="Reconstrói malha TSDF sólida com cor 12 MP ao abrir pacote bruto.")
+    p_view.add_argument("--tsdf-voxel", type=float, default=0.008)
+    p_view.add_argument("--tsdf-focus-radius", type=float, default=None)
+    p_view.add_argument("--depth-upsample", type=int, default=None, choices=[1, 2, 3])
+    p_view.add_argument("--hires-color", action="store_true")
     p_view.add_argument("--point-size", type=float, default=3.5)
     p_view.add_argument("--show-axes", action="store_true", help="Exibe eixos XYZ de referência.")
     p_view.set_defaults(func=cmd_view)

@@ -29,55 +29,16 @@ class TerrainRaster:
     max_y: float
 
 
-def classify_ground_points(
+def _bilinear_sample_grid(
+    grid: np.ndarray,
     xyz: np.ndarray,
     *,
-    cell_size_m: float = 1.0,
-    max_height_above_ground_m: float = 0.25,
+    min_x: float,
+    min_y: float,
+    cell_size_m: float,
 ) -> np.ndarray:
-    """
-    Classifica pontos segundo padrão ASPRS:
-      2 = Ground (solo)
-      5 = High Vegetation / Non-ground (vegetação, cercas, construções)
-    Usa grade de mínimos locais (percentil 5%) + filtro morfológico mediano.
-    """
-    if len(xyz) == 0:
-        return np.empty((0,), dtype=np.uint8)
-
-    min_x, min_y = float(xyz[:, 0].min()), float(xyz[:, 1].min())
-    max_x, max_y = float(xyz[:, 0].max()), float(xyz[:, 1].max())
-
-    nx = max(1, int(np.ceil((max_x - min_x) / cell_size_m)) + 1)
-    ny = max(1, int(np.ceil((max_y - min_y) / cell_size_m)) + 1)
-
-    ix = np.clip(np.floor((xyz[:, 0] - min_x) / cell_size_m).astype(np.int64), 0, nx - 1)
-    iy = np.clip(np.floor((xyz[:, 1] - min_y) / cell_size_m).astype(np.int64), 0, ny - 1)
-    flat_idx = iy * nx + ix
-
-    cell_z = np.full(nx * ny, np.nan, dtype=np.float64)
-    order = np.argsort(flat_idx)
-    sorted_cells = flat_idx[order]
-    sorted_z = xyz[order, 2]
-    unique_cells, starts = np.unique(sorted_cells, return_index=True)
-    splits = np.split(sorted_z, starts[1:])
-    for cid, zs in zip(unique_cells, splits):
-        cell_z[cid] = float(np.percentile(zs, 5))
-
-    grid_z = cell_z.reshape((ny, nx))
-    valid_mask = ~np.isnan(grid_z)
-    if not np.any(valid_mask):
-        return np.full(len(xyz), 2, dtype=np.uint8)
-
-    # Preenche células vazias por vizinho mais próximo antes do filtro mediano
-    vy, vx = np.nonzero(valid_mask)
-    valid_coords = np.column_stack([vx, vy])
-    valid_vals = grid_z[vy, vx]
-    interp_nn = NearestNDInterpolator(valid_coords, valid_vals)
-    gy, gx = np.mgrid[0:ny, 0:nx]
-    filled = interp_nn(gx, gy)
-    smooth_ground = median_filter(filled, size=3)
-
-    # Estima cota do solo na posição exata de cada ponto por interpolação bilinear simples
+    """Estima cota da superfície na posição exata de cada ponto por interpolação bilinear."""
+    ny, nx = grid.shape
     fx = np.clip((xyz[:, 0] - min_x) / cell_size_m, 0.0, float(nx - 1))
     fy = np.clip((xyz[:, 1] - min_y) / cell_size_m, 0.0, float(ny - 1))
     x0 = np.floor(fx).astype(np.int64)
@@ -86,12 +47,146 @@ def classify_ground_points(
     y1 = np.minimum(y0 + 1, ny - 1)
     wx = fx - x0
     wy = fy - y0
+    return (
+        grid[y0, x0] * (1.0 - wx) * (1.0 - wy)
+        + grid[y0, x1] * wx * (1.0 - wy)
+        + grid[y1, x0] * (1.0 - wx) * wy
+        + grid[y1, x1] * wx * wy
+    )
 
-    z_est = (
-        smooth_ground[y0, x0] * (1 - wx) * (1 - wy)
-        + smooth_ground[y0, x1] * wx * (1 - wy)
-        + smooth_ground[y1, x0] * (1 - wx) * wy
-        + smooth_ground[y1, x1] * wx * wy
+
+def _csf_ground_surface(
+    xyz: np.ndarray,
+    *,
+    min_x: float,
+    min_y: float,
+    nx: int,
+    ny: int,
+    cell_size_m: float,
+    rigidness: int = 2,
+    iterations: int = 300,
+    gravity_step_m: float = 0.25,
+) -> np.ndarray | None:
+    """
+    Cloth Simulation Filter (Zhang et al., 2016) em NumPy vetorizado:
+    inverte a nuvem (-Z) e simula um tecido sob gravidade e rigidez de mola
+    para separar solo contínuo de capim alto, árvores e estruturas.
+    """
+    ix = np.clip(np.rint((xyz[:, 0] - min_x) / cell_size_m).astype(np.int64), 0, nx - 1)
+    iy = np.clip(np.rint((xyz[:, 1] - min_y) / cell_size_m).astype(np.int64), 0, ny - 1)
+    flat_idx = iy * nx + ix
+
+    # Na nuvem invertida (-Z), o solo real corresponde aos máximos locais.
+    z_inv = -xyz[:, 2]
+    terrain_inv = np.full(nx * ny, -np.inf, dtype=np.float64)
+    np.maximum.at(terrain_inv, flat_idx, z_inv)
+    terrain_grid = terrain_inv.reshape((ny, nx))
+    valid_mask = np.isfinite(terrain_grid)
+    if not np.any(valid_mask):
+        return None
+
+    vy, vx = np.nonzero(valid_mask)
+    interp_nn = NearestNDInterpolator(np.column_stack([vx, vy]), terrain_grid[vy, vx])
+    gy, gx = np.mgrid[0:ny, 0:nx]
+    terrain_filled = terrain_grid.copy()
+    terrain_filled[~valid_mask] = interp_nn(gx[~valid_mask], gy[~valid_mask])
+
+    cloth = np.full((ny, nx), float(z_inv.max()) + 0.25, dtype=np.float64)
+    passes = max(1, min(3, int(rigidness)))
+
+    for _ in range(max(20, int(iterations))):
+        prev = cloth.copy()
+        movable = cloth > terrain_filled
+        if np.any(movable):
+            cloth[movable] -= gravity_step_m
+        cloth = np.maximum(cloth, terrain_filled)
+
+        for _ in range(passes):
+            padded = np.pad(cloth, 1, mode="edge")
+            avg_nbr = 0.25 * (padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:])
+            pinned = cloth <= (terrain_filled + 1e-6)
+            cloth[~pinned] += 0.5 * (avg_nbr[~pinned] - cloth[~pinned])
+            cloth = np.maximum(cloth, terrain_filled)
+
+        if float(np.max(np.abs(cloth - prev))) < 1e-4:
+            break
+
+    return -cloth
+
+
+def classify_ground_points(
+    xyz: np.ndarray,
+    *,
+    cell_size_m: float = 1.0,
+    max_height_above_ground_m: float = 0.25,
+    method: str = "percentile",
+    csf_rigidness: int = 2,
+    csf_iterations: int = 300,
+) -> np.ndarray:
+    """
+    Classifica pontos segundo padrão ASPRS:
+      2 = Ground (solo)
+      5 = High Vegetation / Non-ground (vegetação, cercas, construções)
+    Métodos disponíveis:
+      - `percentile`: grade de mínimos locais (percentil 5%) + filtro mediano
+      - `csf`: Cloth Simulation Filter físico (Zhang et al., 2016)
+    """
+    if len(xyz) == 0:
+        return np.empty((0,), dtype=np.uint8)
+    if method not in {"percentile", "csf"}:
+        raise ValueError(f"Método de classificação de solo inválido: {method}")
+
+    min_x, min_y = float(xyz[:, 0].min()), float(xyz[:, 1].min())
+    max_x, max_y = float(xyz[:, 0].max()), float(xyz[:, 1].max())
+
+    nx = max(1, int(np.ceil((max_x - min_x) / cell_size_m)) + 1)
+    ny = max(1, int(np.ceil((max_y - min_y) / cell_size_m)) + 1)
+
+    if method == "csf":
+        ground_surface = _csf_ground_surface(
+            xyz,
+            min_x=min_x,
+            min_y=min_y,
+            nx=nx,
+            ny=ny,
+            cell_size_m=cell_size_m,
+            rigidness=csf_rigidness,
+            iterations=csf_iterations,
+        )
+        if ground_surface is None:
+            return np.full(len(xyz), 2, dtype=np.uint8)
+    else:
+        ix = np.clip(np.floor((xyz[:, 0] - min_x) / cell_size_m).astype(np.int64), 0, nx - 1)
+        iy = np.clip(np.floor((xyz[:, 1] - min_y) / cell_size_m).astype(np.int64), 0, ny - 1)
+        flat_idx = iy * nx + ix
+
+        cell_z = np.full(nx * ny, np.nan, dtype=np.float64)
+        order = np.argsort(flat_idx)
+        sorted_cells = flat_idx[order]
+        sorted_z = xyz[order, 2]
+        unique_cells, starts = np.unique(sorted_cells, return_index=True)
+        splits = np.split(sorted_z, starts[1:])
+        for cid, zs in zip(unique_cells, splits):
+            cell_z[cid] = float(np.percentile(zs, 5))
+
+        grid_z = cell_z.reshape((ny, nx))
+        valid_mask = ~np.isnan(grid_z)
+        if not np.any(valid_mask):
+            return np.full(len(xyz), 2, dtype=np.uint8)
+
+        # Preenche células vazias por vizinho mais próximo antes do filtro mediano
+        vy, vx = np.nonzero(valid_mask)
+        interp_nn = NearestNDInterpolator(np.column_stack([vx, vy]), grid_z[vy, vx])
+        gy, gx = np.mgrid[0:ny, 0:nx]
+        filled = interp_nn(gx, gy)
+        ground_surface = median_filter(filled, size=3)
+
+    z_est = _bilinear_sample_grid(
+        ground_surface,
+        xyz,
+        min_x=min_x,
+        min_y=min_y,
+        cell_size_m=cell_size_m,
     )
 
     is_ground = (xyz[:, 2] - z_est) <= max_height_above_ground_m

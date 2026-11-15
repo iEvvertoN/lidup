@@ -112,11 +112,15 @@ struct CaptureView: View {
                 .disabled(controller.isRecording)
             }
 
-            HStack(spacing: 12) {
-                metricPill(title: "Setor", value: controller.sectorName)
-                metricPill(title: "Frames", value: "\(controller.savedFrameCount)")
-                metricPill(title: "Distância", value: String(format: "%.1fm", controller.walkedDistanceM))
-                metricPill(title: "Blur", value: "\(controller.rejectedBlurCount)")
+            HStack(spacing: 8) {
+                metricPill(title: "Fotos", value: "\(controller.savedFrameCount)")
+                metricPill(title: "Depth+", value: "\(controller.savedDepthOnlyCount)")
+                metricPill(title: "Dist", value: String(format: "%.1fm", controller.walkedDistanceM))
+                metricPill(
+                    title: "LiDAR",
+                    value: controller.centerDepthM.map { String(format: "%.2fm", $0) } ?? "-"
+                )
+                metricPill(title: "Gyro", value: String(format: "%.0f°/s", controller.angularSpeedDegS))
             }
         }
     }
@@ -253,14 +257,18 @@ struct CaptureView: View {
                         Spacer()
                         Text(String(format: "%.2f m", controller.minTranslationM))
                     }
-                    Slider(value: $controller.minTranslationM, in: 0.15...2.5, step: 0.05)
+                    Slider(value: $controller.minTranslationM, in: 0.08...2.5, step: 0.02)
 
                     HStack {
                         Text("Rotação mínima")
                         Spacer()
                         Text(String(format: "%.0f°", controller.minRotationDeg))
                     }
-                    Slider(value: $controller.minRotationDeg, in: 5...30, step: 1)
+                    Slider(value: $controller.minRotationDeg, in: 3...30, step: 1)
+                }
+                Section("Física & Sensores (Micro-drone)") {
+                    Toggle("Disparo no vale da IMU (menos blur)", isOn: $controller.imuStabilizedCapture)
+                    Toggle("Depth contínuo entre fotos 12 MP", isOn: $controller.highDensityDepthEnabled)
                 }
                 Section("Ótica & Qualidade") {
                     Toggle("Travar foco e exposição", isOn: $controller.lockCameraOptics)

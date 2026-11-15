@@ -5,10 +5,10 @@ from pathlib import Path
 
 import numpy as np
 
-from lidup.bundle import load_bundle, reconstruct_lidar_point_cloud
+from lidup.bundle import load_bundle, reconstruct_lidar_point_cloud, reconstruct_tsdf_mesh
 from lidup.cli import configure_view_controls, load_geometry_for_view
 from lidup.earthwork import simulate_plateau_earthwork
-from lidup.georef import georeference_points, sirgas2000_utm_epsg, umeyama_alignment
+from lidup.georef import georeference_points, gravity_locked_yaw_alignment, sirgas2000_utm_epsg, umeyama_alignment
 from lidup.gsplat import export_gaussian_splatting_dataset
 from lidup.synthetic import generate_synthetic_bundle
 from lidup.terrain import (
@@ -130,3 +130,138 @@ def test_export_3dgs_and_view_loaders(tmp_path: Path) -> None:
     assert z_after_in < z_before
     assert ctrl["callbacks"][ord("S")](vis) is True
     vis.destroy_window()
+
+
+def test_gravity_locked_alignment_resists_gnss_vertical_noise() -> None:
+    rng = np.random.default_rng(123)
+    # ARKit (+X dir, +Y cima, -Z frente) -> engenharia (X, -Z, Y)
+    pts_arkit = rng.uniform(-5.0, 5.0, size=(12, 3))
+    pts_arkit[:, 1] = rng.uniform(-0.2, 0.2, size=12)
+
+    yaw = 0.72
+    r_yaw = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+    xy_eng = np.column_stack([pts_arkit[:, 0], -pts_arkit[:, 2]])
+    dst_xy = xy_eng @ r_yaw.T + np.array([462500.0, 9221680.0])
+    # Altitude GPS ruidosa (+- 8 m) não deve entortar a gravidade (+Y_arkit -> +Z_utm)
+    noisy_z = pts_arkit[:, 1] + 710.0 + rng.normal(0.0, 6.0, size=12)
+    dst = np.column_stack([dst_xy, noisy_z])
+
+    scale, rot, _ = gravity_locked_yaw_alignment(pts_arkit, dst, allow_scale=False)
+    assert np.isclose(scale, 1.0)
+    up_in_utm = rot @ np.array([0.0, 1.0, 0.0])
+    assert np.allclose(up_in_utm, np.array([0.0, 0.0, 1.0]), atol=1e-9)
+
+
+def test_csf_and_physics_posegraph_pipeline(tmp_path: Path) -> None:
+    bundle_dir = generate_synthetic_bundle(tmp_path / "sample_csf", length_x_m=16.0, width_y_m=10.0)
+    bundle = load_bundle(bundle_dir)
+
+    pcd_pg = reconstruct_lidar_point_cloud(
+        bundle,
+        min_confidence=2,
+        max_depth_m=4.5,
+        voxel_size_m=0.08,
+        pose_refine="posegraph",
+        max_incidence_deg=75.0,
+        physics_weight=True,
+    )
+    pts_arkit = np.asarray(pcd_pg.points)
+    assert len(pts_arkit) > 150
+
+    pts_geo, geo = georeference_points(pts_arkit, bundle, lock_gravity=True)
+    assert geo.mode == "stationary_gcps"
+    assert "gravidade travada" in geo.notes
+
+    classes_csf = classify_ground_points(pts_geo, cell_size_m=0.8, max_height_above_ground_m=0.25, method="csf")
+    ground_pts = pts_geo[classes_csf == 2]
+    non_ground_pts = pts_geo[classes_csf != 2]
+    assert len(ground_pts) > 100
+    assert len(non_ground_pts) > 0
+
+
+def test_tsdf_mesh_and_hires_color(tmp_path: Path) -> None:
+    import open3d as o3d
+
+    bundle_dir = generate_synthetic_bundle(tmp_path / "sample_tsdf", length_x_m=12.0, width_y_m=8.0)
+    bundle = load_bundle(bundle_dir)
+
+    pcd, mesh = reconstruct_tsdf_mesh(
+        bundle,
+        min_confidence=2,
+        max_depth_m=4.5,
+        tsdf_voxel_m=0.04,
+        pose_refine="posegraph",
+        hires_color=True,
+    )
+    assert len(pcd.points) > 100
+    assert len(mesh.vertices) > 100
+    assert len(mesh.triangles) > 100
+
+    mesh_path = tmp_path / "object_mesh_local.ply"
+    o3d.io.write_triangle_mesh(str(mesh_path), mesh)
+    loaded, title = load_geometry_for_view(tmp_path)
+    assert "Mesh" in title
+    assert len(np.asarray(loaded.triangles)) == len(mesh.triangles)
+
+
+def test_guided_depth_upsample_edge_unmixing_and_focus() -> None:
+    from lidup.bundle import _estimate_orbit_focus_point, _upsample_depth_guided_by_rgb
+
+    d_h, d_w, scale = 32, 40, 2
+    depth_lo = np.full((d_h, d_w), 2.5, dtype=np.float64)
+    depth_lo[:, :20] = 1.0
+    valid_lo = np.ones((d_h, d_w), dtype=bool)
+    conf_lo = np.full((d_h, d_w), 2, dtype=np.uint8)
+
+    rgb_lo = np.zeros((d_h, d_w, 3), dtype=np.float64)
+    rgb_lo[:, :20] = [0.9, 0.2, 0.2]
+    rgb_lo[:, 20:] = [0.1, 0.2, 0.8]
+
+    rgb_hi = np.zeros((d_h * scale, d_w * scale, 3), dtype=np.float64)
+    rgb_hi[:, : 20 * scale] = [0.9, 0.2, 0.2]
+    rgb_hi[:, 20 * scale :] = [0.1, 0.2, 0.8]
+
+    up_depth, up_mask, _ = _upsample_depth_guided_by_rgb(
+        depth_lo, valid_lo, conf_lo, rgb_lo, rgb_hi, scale=scale, edge_jump_m=0.12
+    )
+    assert up_depth.shape == (d_h * scale, d_w * scale)
+    fg = up_depth[:, : 20 * scale][up_mask[:, : 20 * scale]]
+    bg = up_depth[:, 20 * scale :][up_mask[:, 20 * scale :]]
+    assert len(fg) > 0 and len(bg) > 0
+    assert np.all(np.abs(fg - 1.0) < 0.03)
+    assert np.all(np.abs(bg - 2.5) < 0.03)
+
+    target = np.array([1.5, 0.5, -2.0])
+    poses = []
+    for ang in np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False):
+        cam_pos = target + np.array([2.0 * np.cos(ang), 0.2, 2.0 * np.sin(ang)])
+        z_axis = target - cam_pos
+        z_axis /= np.linalg.norm(z_axis)
+        x_axis = np.cross(np.array([0.0, 1.0, 0.0]), z_axis)
+        x_axis /= np.linalg.norm(x_axis)
+        y_axis = np.cross(z_axis, x_axis)
+        tf = np.eye(4)
+        tf[:3, 0] = x_axis
+        tf[:3, 1] = y_axis
+        tf[:3, 2] = z_axis
+        tf[:3, 3] = cam_pos
+        poses.append(tf)
+
+    focus = _estimate_orbit_focus_point(poses)
+    assert focus is not None
+    assert np.allclose(focus, target, atol=0.15)
+
+
+def test_depth_only_intermediate_frames_supported(tmp_path: Path) -> None:
+    bundle_dir = generate_synthetic_bundle(tmp_path / "sample_depthonly", length_x_m=10.0, width_y_m=8.0)
+    frames_csv = bundle_dir / "frames.csv"
+    lines = frames_csv.read_text(encoding="utf-8").splitlines()
+    # Remove o image_file de um frame intermediário simulando burst somente de depth
+    parts = lines[2].split(",")
+    parts[2] = ""
+    lines[2] = ",".join(parts)
+    frames_csv.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    bundle = load_bundle(bundle_dir)
+    pcd = reconstruct_lidar_point_cloud(bundle, voxel_size_m=0.06, depth_upsample=2)
+    assert len(pcd.points) > 100

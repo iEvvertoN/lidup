@@ -66,6 +66,38 @@ struct DepthSnapshot: Sendable {
             confidence: confValues
         )
     }
+
+    /// Amostra rapidamente a distância central (m) sem copiar todo o buffer, para orientação do operador.
+    static func centerDepthMeters(from depthMap: CVPixelBuffer) -> Float? {
+        guard CVPixelBufferGetPixelFormatType(depthMap) == kCVPixelFormatType_DepthFloat32 else {
+            return nil
+        }
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        guard width >= 5, height >= 5, let base = CVPixelBufferGetBaseAddress(depthMap) else {
+            return nil
+        }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        let cy = height / 2
+        let cx = width / 2
+
+        var sum: Float = 0
+        var count = 0
+        for dy in -2...2 {
+            let rowPtr = base.advanced(by: (cy + dy) * bytesPerRow).assumingMemoryBound(to: Float32.self)
+            for dx in -2...2 {
+                let d = rowPtr[cx + dx]
+                if d.isFinite && d > 0.05 && d < 12.0 {
+                    sum += d
+                    count += 1
+                }
+            }
+        }
+        return count > 0 ? (sum / Float(count)) : nil
+    }
 }
 
 /// Codifica PNG 16-bit grayscale (profundidade em mm) e PNG 8-bit grayscale (confiança 0/1/2) em Swift puro.
