@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from lidup.bundle import load_bundle, reconstruct_lidar_point_cloud
-from lidup.cli import load_geometry_for_view
+from lidup.cli import configure_view_controls, load_geometry_for_view
 from lidup.earthwork import simulate_plateau_earthwork
 from lidup.georef import georeference_points, sirgas2000_utm_epsg, umeyama_alignment
 from lidup.gsplat import export_gaussian_splatting_dataset
@@ -116,3 +116,17 @@ def test_export_3dgs_and_view_loaders(tmp_path: Path) -> None:
     geom_bundle, title_bundle = load_geometry_for_view(bundle_dir, min_confidence=2, voxel_size_m=0.1)
     assert len(np.asarray(geom_bundle.points)) > 100
     assert "Bundle" in title_bundle
+
+    import open3d as o3d
+
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(visible=False)
+    vis.add_geometry(geom_ply)
+    ctrl = configure_view_controls(vis, geom_ply)
+    assert ctrl["move_step"] >= 0.05
+    z_before = float(vis.get_view_control().convert_to_pinhole_camera_parameters().extrinsic[2, 3])
+    assert ctrl["callbacks"][ord("W")](vis) is True
+    z_after_in = float(vis.get_view_control().convert_to_pinhole_camera_parameters().extrinsic[2, 3])
+    assert z_after_in < z_before
+    assert ctrl["callbacks"][ord("S")](vis) is True
+    vis.destroy_window()

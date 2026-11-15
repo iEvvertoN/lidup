@@ -246,6 +246,68 @@ def load_geometry_for_view(
     return pcd, f"Lidup PLY ({resolved.name} — {len(pts)} pts)"
 
 
+def configure_view_controls(
+    vis: o3d.visualization.VisualizerWithKeyCallback,
+    geom: o3d.geometry.Geometry3D,
+) -> dict[str, Any]:
+    """Registra atalhos de teclado para aproximar, distanciar, mover e resetar a câmera."""
+    bbox = geom.get_axis_aligned_bounding_box()
+    max_extent = float(np.max(bbox.get_extent())) if not bbox.is_empty() else 2.0
+    move_step = max(0.05, max_extent * 0.06)
+
+    def _zoom_in(v: o3d.visualization.Visualizer) -> bool:
+        vc = v.get_view_control()
+        vc.scale(-3.0)
+        vc.camera_local_translate(move_step * 0.5, 0.0, 0.0)
+        return True
+
+    def _zoom_out(v: o3d.visualization.Visualizer) -> bool:
+        vc = v.get_view_control()
+        vc.scale(3.0)
+        vc.camera_local_translate(-move_step * 0.5, 0.0, 0.0)
+        return True
+
+    def _move_forward(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_translate(move_step, 0.0, 0.0)
+        return True
+
+    def _move_backward(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_translate(-move_step, 0.0, 0.0)
+        return True
+
+    def _move_left(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_translate(0.0, -move_step, 0.0)
+        return True
+
+    def _move_right(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_translate(0.0, move_step, 0.0)
+        return True
+
+    def _reset_view(v: o3d.visualization.Visualizer) -> bool:
+        v.reset_view_point(True)
+        return True
+
+    # Códigos GLFW: Setas (262..265), PageUp/PageDown (266..267)
+    callbacks = {
+        ord("W"): _zoom_in,
+        265: _zoom_in,       # Seta para cima
+        ord("S"): _zoom_out,
+        264: _zoom_out,      # Seta para baixo
+        ord("I"): _move_forward,
+        266: _move_forward,  # PageUp
+        ord("O"): _move_backward,
+        267: _move_backward, # PageDown
+        ord("A"): _move_left,
+        263: _move_left,     # Seta esquerda
+        ord("D"): _move_right,
+        262: _move_right,    # Seta direita
+        ord("R"): _reset_view,
+    }
+    for key_code, fn in callbacks.items():
+        vis.register_key_callback(key_code, fn)
+    return {"move_step": move_step, "callbacks": callbacks}
+
+
 def cmd_view(args: argparse.Namespace) -> None:
     geom, title = load_geometry_for_view(
         args.target,
@@ -254,15 +316,19 @@ def cmd_view(args: argparse.Namespace) -> None:
         voxel_size_m=args.voxel_size,
     )
     print(f"[lidup] Abrindo visualizador 3D: {title}")
-    print("[lidup] Controles: Arrastar esquerdo = girar | Scroll = zoom | Shift+Arrastar = mover | +/- = tamanho dos pontos | Q = fechar")
+    print(
+        "[lidup] Controles: Arrastar esquerdo = girar | Scroll ou W/↑ = aproximar | S/↓ = distanciar | "
+        "I/O ou PgUp/PgDn = entrar/recuar | A/D = mover lados | R = resetar | +/- = tamanho dos pontos | Q = fechar"
+    )
 
-    vis = o3d.visualization.Visualizer()
+    vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(window_name=title, width=1280, height=800)
     vis.add_geometry(geom)
     if args.show_axes:
         axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
         vis.add_geometry(axes)
 
+    configure_view_controls(vis, geom)
     opt = vis.get_render_option()
     opt.background_color = np.asarray([0.08, 0.09, 0.11])
     opt.point_size = float(args.point_size)
