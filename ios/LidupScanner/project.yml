@@ -26,7 +26,17 @@ targets:
         GENERATE_INFOPLIST_FILE: "NO"
         PRODUCT_BUNDLE_IDENTIFIER: com.lidup.scanner
         PRODUCT_NAME: LidupScanner
-        MARKETING_VERSION: "0.2.0"
-        CURRENT_PROJECT_VERSION: "2"
+        MARKETING_VERSION: "0.3.0"
+        CURRENT_PROJECT_VERSION: "3"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/LidupScanner-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../../core/lidup_core/include
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../../core/lidup_core/target/aarch64-apple-ios/release
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -llidup_core
     scheme:
       testTargets: []

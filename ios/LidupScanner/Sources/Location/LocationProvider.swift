@@ -57,46 +57,25 @@ final class CoreLocationProvider: NSObject, ObservableObject, LocationProviding,
         manager.stopUpdatingLocation()
     }
 
-    /// Calcula média ponderada pela variância inversa da acurácia horizontal/vertical.
+    /// Calcula média ponderada pela variância inversa da acurácia horizontal/vertical (via motor Rust).
     static func computeWeightedAverage(samples: [GNSSSample]) -> StationaryGNSSAverage? {
-        let valid = samples.filter { $0.hAccM > 0 && $0.hAccM < 100 }
-        guard !valid.isEmpty else { return nil }
-
-        var wLatSum = 0.0
-        var wLonSum = 0.0
-        var wHorizTotal = 0.0
-        var wAltSum = 0.0
-        var wVertTotal = 0.0
-        var hAccSum = 0.0
-        var vAccSum = 0.0
-        var vCount = 0
-
-        for s in valid {
-            let wh = 1.0 / max(s.hAccM * s.hAccM, 0.25)
-            wLatSum += s.lat * wh
-            wLonSum += s.lon * wh
-            wHorizTotal += wh
-            hAccSum += s.hAccM
-
-            if s.vAccM > 0 {
-                let wv = 1.0 / max(s.vAccM * s.vAccM, 0.25)
-                wAltSum += s.altEllipsoidalM * wv
-                wVertTotal += wv
-                vAccSum += s.vAccM
-                vCount += 1
-            }
+        guard !samples.isEmpty else { return nil }
+        guard let avg = LidupRustCore.weightedGNSSAverage(
+            lat: samples.map(\.lat),
+            lon: samples.map(\.lon),
+            alt: samples.map(\.altEllipsoidalM),
+            hAcc: samples.map(\.hAccM),
+            vAcc: samples.map(\.vAccM)
+        ) else {
+            return nil
         }
-
-        let meanAlt = wVertTotal > 0 ? (wAltSum / wVertTotal) : (valid.map(\.altEllipsoidalM).reduce(0, +) / Double(valid.count))
-        let meanVAcc = vCount > 0 ? (vAccSum / Double(vCount)) : -1.0
-
         return StationaryGNSSAverage(
-            sampleCount: valid.count,
-            lat: wLatSum / wHorizTotal,
-            lon: wLonSum / wHorizTotal,
-            altEllipsoidalM: meanAlt,
-            hAccMeanM: hAccSum / Double(valid.count),
-            vAccMeanM: meanVAcc
+            sampleCount: avg.count,
+            lat: avg.lat,
+            lon: avg.lon,
+            altEllipsoidalM: avg.alt,
+            hAccMeanM: avg.hAccMean,
+            vAccMeanM: avg.vAccMean
         )
     }
 

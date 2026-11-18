@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 
@@ -10,11 +11,13 @@ import numpy as np
 import open3d as o3d
 import rasterio
 
-from .bundle import load_bundle, reconstruct_lidar_point_cloud, reconstruct_tsdf_mesh
+from .architecture import analyze_room_geometry
+from .bundle import load_bundle, reconstruct_lidar_point_cloud, reconstruct_tsdf_details, reconstruct_tsdf_mesh
 from .earthwork import simulate_plateau_earthwork
 from .georef import arkit_to_engineering_local, georeference_points
 from .gsplat import export_gaussian_splatting_dataset
 from .synthetic import generate_synthetic_bundle
+from .texture import bake_uv_texture_obj
 from .terrain import (
     TerrainRaster,
     build_dtm_raster,
@@ -43,9 +46,11 @@ def cmd_process(args: argparse.Namespace) -> None:
 
     max_inc = None if (args.max_incidence_deg is None or args.max_incidence_deg <= 0 or args.max_incidence_deg >= 90) else float(args.max_incidence_deg)
     tsdf_mesh: o3d.geometry.TriangleMesh | None = None
+    tsdf_extracted = []
+    tsdf_poses = []
     if args.tsdf:
         upsample = args.depth_upsample if args.depth_upsample is not None else 2
-        pcd, tsdf_mesh = reconstruct_tsdf_mesh(
+        pcd, tsdf_mesh, tsdf_extracted, tsdf_poses = reconstruct_tsdf_details(
             bundle,
             min_confidence=args.min_confidence,
             max_depth_m=args.max_depth,
@@ -57,6 +62,8 @@ def cmd_process(args: argparse.Namespace) -> None:
             hires_color=True,
             depth_upsample=upsample,
             focus_radius_m=args.tsdf_focus_radius,
+            use_mvs=args.mvs,
+            photometric_opt=(args.photometric_opt or args.mvs),
         )
     else:
         upsample = args.depth_upsample if args.depth_upsample is not None else 1
@@ -112,6 +119,7 @@ def cmd_process(args: argparse.Namespace) -> None:
 
     generated: list[Path] = [laz_path, ply_path, mdt_path, slope_path, contours_path, obj_path]
     if tsdf_mesh is not None and len(tsdf_mesh.vertices) > 0:
+        mesh_arkit_copy = o3d.geometry.TriangleMesh(tsdf_mesh) if args.uv_texture else None
         verts_arkit = np.asarray(tsdf_mesh.vertices, dtype=np.float64)
         verts_local = (verts_arkit * geo.scale) @ geo.rotation.T + geo.translation - geo.origin_utm
         tsdf_mesh.vertices = o3d.utility.Vector3dVector(verts_local)
@@ -119,6 +127,18 @@ def cmd_process(args: argparse.Namespace) -> None:
         mesh_path = out_dir / "object_mesh_local.ply"
         o3d.io.write_triangle_mesh(str(mesh_path), tsdf_mesh)
         generated.append(mesh_path)
+        if args.uv_texture and mesh_arkit_copy is not None and tsdf_extracted:
+            uv_obj = bake_uv_texture_obj(
+                bundle,
+                mesh_arkit_copy,
+                verts_local,
+                tsdf_extracted,
+                tsdf_poses,
+                out_dir / "object_textured.obj",
+                max_depth_m=args.max_depth,
+            )
+            generated.append(uv_obj)
+            generated.append(uv_obj.with_suffix(".jpg"))
     if args.with_3dgs:
         gs_info = export_gaussian_splatting_dataset(
             bundle,
@@ -230,7 +250,7 @@ def _resolve_view_target(target: Path) -> Path:
         raise FileNotFoundError(f"Caminho não encontrado: {target}")
     if (target / "manifest.json").exists():
         return target
-    for candidate in ("object_mesh_local.ply", "cloud_local.ply", "cloud.ply", "points3D.ply", "cloud.laz", "cloud.las", "terrain_local.obj"):
+    for candidate in ("object_textured.obj", "object_mesh_local.ply", "cloud_local.ply", "cloud.ply", "points3D.ply", "cloud.laz", "cloud.las", "terrain_local.obj"):
         p = target / candidate
         if p.exists():
             return p
@@ -253,6 +273,8 @@ def load_geometry_for_view(
     hires_color: bool = False,
     depth_upsample: int | None = None,
     tsdf_focus_radius_m: float | None = None,
+    use_mvs: bool = False,
+    photometric_opt: bool = False,
 ) -> tuple[o3d.geometry.Geometry3D, str]:
     """Carrega uma nuvem (.ply/.laz), malha (.ply/.obj) ou bundle bruto `lidup_bundle_v1` para visualização 3D."""
     resolved = _resolve_view_target(Path(target))
@@ -273,6 +295,8 @@ def load_geometry_for_view(
                 hires_color=True,
                 depth_upsample=upsample,
                 focus_radius_m=tsdf_focus_radius_m,
+                use_mvs=use_mvs,
+                photometric_opt=(photometric_opt or use_mvs),
             )
             verts = np.asarray(mesh.vertices, dtype=np.float64)
             if len(verts) == 0:
@@ -319,9 +343,13 @@ def load_geometry_for_view(
         return pcd, f"Lidup LAZ ({resolved.name} — {len(pts)} pts)"
 
     if suffix == ".obj":
-        mesh = o3d.io.read_triangle_mesh(str(resolved))
+        mesh = o3d.io.read_triangle_mesh(str(resolved), enable_post_processing=True)
+        v = np.asarray(mesh.vertices, dtype=np.float64)
+        if len(v) > 0 and np.max(np.abs(v)) > 1000.0:
+            mesh.vertices = o3d.utility.Vector3dVector(v - v.mean(axis=0))
         mesh.compute_vertex_normals()
-        return mesh, f"Lidup OBJ ({resolved.name} — {len(mesh.vertices)} vértices)"
+        tag = "OBJ-UV" if mesh.has_textures() else "OBJ"
+        return mesh, f"Lidup {tag} ({resolved.name} — {len(mesh.vertices)} vértices)"
 
     if suffix == ".ply":
         mesh_try = o3d.io.read_triangle_mesh(str(resolved))
@@ -341,14 +369,57 @@ def load_geometry_for_view(
     return pcd, f"Lidup PLY ({resolved.name} — {len(pts)} pts)"
 
 
+def _elevation_colors(pts: np.ndarray) -> np.ndarray:
+    if len(pts) == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    z = pts[:, 2]
+    z_lo, z_hi = float(np.percentile(z, 2.0)), float(np.percentile(z, 98.0))
+    t = np.clip((z - z_lo) / max(z_hi - z_lo, 1e-4), 0.0, 1.0)
+    r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
+    return np.column_stack([r, g, b])
+
+
 def configure_view_controls(
     vis: o3d.visualization.VisualizerWithKeyCallback,
     geom: o3d.geometry.Geometry3D,
+    *,
+    start_no_color: bool = False,
 ) -> dict[str, Any]:
-    """Registra atalhos de teclado para aproximar, distanciar, mover e resetar a câmera."""
+    """Registra atalhos de teclado para aproximar, distanciar, mover, resetar câmera e alternar cor/relevo."""
     bbox = geom.get_axis_aligned_bounding_box()
     max_extent = float(np.max(bbox.get_extent())) if not bbox.is_empty() else 2.0
     move_step = max(0.05, max_extent * 0.06)
+
+    is_mesh = isinstance(geom, o3d.geometry.TriangleMesh)
+    pts_ref = np.asarray(geom.vertices if is_mesh else geom.points, dtype=np.float64)
+    orig_textures = list(geom.textures) if (is_mesh and geom.has_textures()) else []
+    orig_cols = np.asarray(geom.vertex_colors if is_mesh else geom.colors, dtype=np.float64).copy()
+    if len(orig_cols) != len(pts_ref):
+        orig_cols = np.full((len(pts_ref), 3), 0.72, dtype=np.float64)
+    elev_cols = _elevation_colors(pts_ref)
+    gray_cols = np.full((len(pts_ref), 3), 0.74, dtype=np.float64)
+    palettes = [orig_cols, gray_cols, elev_cols]
+    color_state = {"mode": 1 if start_no_color else 0}
+
+    def _apply_palette(mode_idx: int) -> None:
+        if is_mesh and orig_textures:
+            geom.textures = orig_textures if mode_idx == 0 else []
+        vec = o3d.utility.Vector3dVector(palettes[mode_idx])
+        if is_mesh:
+            geom.vertex_colors = vec
+        else:
+            geom.colors = vec
+
+    if start_no_color:
+        _apply_palette(1)
+
+    def _toggle_color(v: o3d.visualization.Visualizer) -> bool:
+        color_state["mode"] = (color_state["mode"] + 1) % 3
+        _apply_palette(color_state["mode"])
+        v.update_geometry(geom)
+        return True
 
     def _zoom_in(v: o3d.visualization.Visualizer) -> bool:
         vc = v.get_view_control()
@@ -397,10 +468,61 @@ def configure_view_controls(
         ord("D"): _move_right,
         262: _move_right,    # Seta direita
         ord("R"): _reset_view,
+        ord("C"): _toggle_color,
     }
     for key_code, fn in callbacks.items():
         vis.register_key_callback(key_code, fn)
     return {"move_step": move_step, "callbacks": callbacks}
+
+
+def compute_picked_measurements(
+    points: np.ndarray,
+    picked_indices: list[int],
+    *,
+    up_axis: str = "y",
+) -> list[dict[str, float | int]]:
+    """Calcula distâncias 3D, deltas ortogonais e declividade (%) entre pontos consecutivos marcados."""
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        return []
+    valid = [int(i) for i in picked_indices if 0 <= int(i) < len(pts)]
+    axis_idx = 2 if up_axis.strip().lower() == "z" else 1
+    horiz_axes = [i for i in range(3) if i != axis_idx]
+
+    segments: list[dict[str, float | int]] = []
+    for idx_a, idx_b in zip(valid, valid[1:]):
+        p1 = pts[idx_a]
+        p2 = pts[idx_b]
+        delta = p2 - p1
+        dist_3d = float(np.linalg.norm(delta))
+        dist_horiz = float(math.hypot(float(delta[horiz_axes[0]]), float(delta[horiz_axes[1]])))
+        dz_up = float(delta[axis_idx])
+        slope_pct = (abs(dz_up) / dist_horiz * 100.0) if dist_horiz > 1e-6 else 0.0
+        segments.append(
+            {
+                "from_index": idx_a,
+                "to_index": idx_b,
+                "dist_3d_m": round(dist_3d, 4),
+                "dist_horiz_m": round(dist_horiz, 4),
+                "dx_m": round(float(delta[0]), 4),
+                "dy_m": round(float(delta[1]), 4),
+                "dz_m": round(float(delta[2]), 4),
+                "dv_up_m": round(dz_up, 4),
+                "slope_pct": round(slope_pct, 2),
+            }
+        )
+    return segments
+
+
+def cmd_analyze_room(args: argparse.Namespace) -> None:
+    report = analyze_room_geometry(args.target, args.out, up_axis=args.up_axis)
+    print(f"[lidup] Análise arquitetônica salva em: {args.out}")
+    print(
+        f"[lidup] Cômodo: {report.width_m:.2f} × {report.length_m:.2f} m | "
+        f"Área piso: {report.floor_area_m2:.2f} m² | "
+        f"Pé-direito ({report.ceiling_source}): {report.ceiling_height_m:.2f} m | "
+        f"Planeza piso RMS: {report.floor_flatness_rms_mm:.1f} mm (P95: {report.floor_flatness_p95_mm:.1f} mm)"
+    )
 
 
 def cmd_view(args: argparse.Namespace) -> None:
@@ -420,11 +542,56 @@ def cmd_view(args: argparse.Namespace) -> None:
         hires_color=(args.hires_color or args.tsdf),
         depth_upsample=args.depth_upsample,
         tsdf_focus_radius_m=args.tsdf_focus_radius,
+        use_mvs=args.mvs,
+        photometric_opt=args.photometric_opt,
     )
+    if args.measure:
+        pick_geom = geom
+        if isinstance(geom, o3d.geometry.TriangleMesh):
+            pick_geom = o3d.geometry.PointCloud(geom.vertices)
+            if geom.has_vertex_colors():
+                pick_geom.colors = geom.vertex_colors
+            else:
+                pick_geom.paint_uniform_color([0.75, 0.78, 0.82])
+        print(
+            "[lidup] Modo Régua 3D ativo: segure SHIFT + clique esquerdo para marcar pontos (Shift+Dir desfaz) e pressione Q para calcular as distâncias."
+        )
+        vis = o3d.visualization.VisualizerWithEditing()
+        vis.create_window(window_name=f"{title} [Régua 3D: Shift+Clique | Q fecha]", width=1280, height=800)
+        vis.add_geometry(pick_geom)
+        if args.show_axes:
+            vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5))
+        opt = vis.get_render_option()
+        opt.background_color = np.asarray([0.08, 0.09, 0.11])
+        opt.point_size = float(args.point_size)
+        vis.run()
+        picked = list(vis.get_picked_points())
+        vis.destroy_window()
+
+        up_hint = "z" if "georef" in str(args.target).lower() else "y"
+        pts_arr = np.asarray(pick_geom.points)
+        segs = compute_picked_measurements(pts_arr, picked, up_axis=up_hint)
+        if not picked:
+            print("[lidup] Nenhum ponto selecionado.")
+        elif len(picked) == 1:
+            p0 = pts_arr[picked[0]]
+            print(f"[lidup] 1 ponto selecionado (#{picked[0]}): ({p0[0]:.3f}, {p0[1]:.3f}, {p0[2]:.3f}) m — marque ao menos 2 pontos.")
+        else:
+            total_m = sum(float(s["dist_3d_m"]) for s in segs)
+            for i, s in enumerate(segs, start=1):
+                print(
+                    f"[lidup] Trecho {i} (#{s['from_index']} -> #{s['to_index']}): "
+                    f"3D = {s['dist_3d_m']:.3f} m ({s['dist_3d_m'] * 100.0:.1f} cm) | "
+                    f"Horiz = {s['dist_horiz_m']:.3f} m | dV = {s['dv_up_m']:+.3f} m | Incl = {s['slope_pct']:.1f}% | "
+                    f"(dX={s['dx_m']:+.3f}, dY={s['dy_m']:+.3f}, dZ={s['dz_m']:+.3f})"
+                )
+            print(f"[lidup] Total acumulado ({len(segs)} trechos): {total_m:.3f} m")
+        return
+
     print(f"[lidup] Abrindo visualizador 3D: {title}")
     print(
         "[lidup] Controles: Arrastar esquerdo = girar | Scroll ou W/↑ = aproximar | S/↓ = distanciar | "
-        "I/O ou PgUp/PgDn = entrar/recuar | A/D = mover lados | R = resetar | +/- = tamanho dos pontos | Q = fechar"
+        "I/O ou PgUp/PgDn = entrar/recuar | A/D = mover lados | C = alternar Cor/Cinza/Altura | R = resetar | +/- = tamanho | Q = fechar"
     )
 
     vis = o3d.visualization.VisualizerWithKeyCallback()
@@ -434,7 +601,7 @@ def cmd_view(args: argparse.Namespace) -> None:
         axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
         vis.add_geometry(axes)
 
-    configure_view_controls(vis, geom)
+    configure_view_controls(vis, geom, start_no_color=args.no_color)
     opt = vis.get_render_option()
     opt.background_color = np.asarray([0.08, 0.09, 0.11])
     opt.point_size = float(args.point_size)
@@ -472,6 +639,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_proc.add_argument("--tsdf-voxel", type=float, default=0.008, help="Tamanho do voxel da malha TSDF em metros (padrão: 0.008 = 8 mm).")
     p_proc.add_argument("--tsdf-focus-radius", type=float, default=None, help="Raio (m) ao redor do centro de convergência das câmeras 360° para concentrar o voxel fino no objeto.")
     p_proc.add_argument("--depth-upsample", type=int, default=None, choices=[1, 2, 3], help="Super-resolução de profundidade guiada por bordas RGB (padrão: 2 com --tsdf, 1 na nuvem esparsa).")
+    p_proc.add_argument("--mvs", action="store_true", help="Ativa refinamento estéreo multi-visão guiado por LiDAR (micro-relevos via ZNCC) + otimização fotométrica.")
+    p_proc.add_argument("--photometric-opt", action="store_true", help="Ativa otimização fotométrica de câmera/cor (Open3D ColorMapOptimizer) sobre a malha.")
+    p_proc.add_argument("--uv-texture", action="store_true", help="Gera object_textured.obj + .mtl + atlas JPEG 12 MP (usar com --tsdf).")
     p_proc.add_argument("--hires-color", action="store_true", help="Projeta cores diretamente das fotos 12 MP em vez de 256x192.")
     p_proc.add_argument("--georef-alignment", default="gravity_locked", choices=["gravity_locked", "free_3d", "local"], help="Alinhamento GNSS: gravidade travada (padrão), 3D livre legado ou local.")
     p_proc.add_argument("--ground-method", default="csf", choices=["csf", "percentile"], help="Método de classificação de solo: CSF físico (padrão) ou percentil.")
@@ -512,10 +682,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_view.add_argument("--tsdf-voxel", type=float, default=0.008)
     p_view.add_argument("--tsdf-focus-radius", type=float, default=None)
     p_view.add_argument("--depth-upsample", type=int, default=None, choices=[1, 2, 3])
+    p_view.add_argument("--mvs", action="store_true")
+    p_view.add_argument("--photometric-opt", action="store_true")
     p_view.add_argument("--hires-color", action="store_true")
+    p_view.add_argument("--no-color", action="store_true", help="Abre em cinza neutro (pressione C na janela para alternar Cor/Cinza/Altura).")
+    p_view.add_argument("--measure", action="store_true", help="Modo régua 3D interativa (Shift+Clique nos pontos, Q fecha e imprime medidas).")
     p_view.add_argument("--point-size", type=float, default=3.5)
     p_view.add_argument("--show-axes", action="store_true", help="Exibe eixos XYZ de referência.")
     p_view.set_defaults(func=cmd_view)
+
+    p_room = sub.add_parser("analyze-room", help="Extrai planta baixa 2D (SVG/DXF), pé-direito, área m² e planeza do piso em mm.")
+    p_room.add_argument("target", help="Arquivo (.ply/.obj/.las/.laz) ou pasta de saída processada.")
+    p_room.add_argument("--out", required=True, help="Pasta de saída para floorplan.svg, floorplan.dxf, floor_flatness.ply e room_report.json.")
+    p_room.add_argument("--up-axis", default="auto", choices=["auto", "y", "z"], help="Eixo vertical UP (auto, y para nuvem local ARKit, z para georef/ENU).")
+    p_room.set_defaults(func=cmd_analyze_room)
 
     return parser
 

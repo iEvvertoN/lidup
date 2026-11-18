@@ -4,6 +4,110 @@ import CoreVideo
 import ImageIO
 import UniformTypeIdentifiers
 
+/// Cópia bruta ultrarrápida (memcpy de bytes) dos buffers de profundidade para não bloquear a Main Thread.
+struct RawDepthSnapshot: Sendable {
+    let width: Int
+    let height: Int
+    let depthBytesPerRow: Int
+    let depthRaw: Data
+    let confidenceBytesPerRow: Int
+    let confidenceRaw: Data?
+
+    static func captureRaw(from depthMap: CVPixelBuffer, confidenceMap: CVPixelBuffer?) -> RawDepthSnapshot? {
+        guard CVPixelBufferGetPixelFormatType(depthMap) == kCVPixelFormatType_DepthFloat32 else {
+            return nil
+        }
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        guard width > 0, height > 0, let base = CVPixelBufferGetBaseAddress(depthMap) else {
+            return nil
+        }
+        let depthData = Data(bytes: base, count: height * bytesPerRow)
+
+        var confData: Data? = nil
+        var confStride = 0
+        if let confidenceMap,
+           CVPixelBufferGetPixelFormatType(confidenceMap) == kCVPixelFormatType_OneComponent8 {
+            CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly) }
+            let cW = CVPixelBufferGetWidth(confidenceMap)
+            let cH = CVPixelBufferGetHeight(confidenceMap)
+            let cBytes = CVPixelBufferGetBytesPerRow(confidenceMap)
+            if cW == width && cH == height, let cBase = CVPixelBufferGetBaseAddress(confidenceMap) {
+                confStride = cBytes
+                confData = Data(bytes: cBase, count: cH * cBytes)
+            }
+        }
+
+        return RawDepthSnapshot(
+            width: width,
+            height: height,
+            depthBytesPerRow: bytesPerRow,
+            depthRaw: depthData,
+            confidenceBytesPerRow: confStride,
+            confidenceRaw: confData
+        )
+    }
+
+    func convert() -> DepthSnapshot {
+        let mmValues: [UInt16]
+        if let rustMM = LidupRustCore.convertFloat32DepthToMillimeters(
+            depthRaw: depthRaw,
+            bytesPerRow: depthBytesPerRow,
+            width: width,
+            height: height
+        ) {
+            mmValues = rustMM
+        } else {
+            var fallback = [UInt16](repeating: 0, count: width * height)
+            depthRaw.withUnsafeBytes { rawBuf in
+                guard rawBuf.baseAddress != nil else { return }
+                for y in 0..<height {
+                    let rowOff = y * depthBytesPerRow
+                    guard rowOff + width * 4 <= rawBuf.count else { break }
+                    for x in 0..<width {
+                        let meters = rawBuf.loadUnaligned(fromByteOffset: rowOff + x * 4, as: Float32.self)
+                        if meters.isFinite && meters > 0 {
+                            let mm = (meters * 1000.0).rounded()
+                            fallback[y * width + x] = UInt16(min(max(mm, 0), Float(UInt16.max)))
+                        }
+                    }
+                }
+            }
+            mmValues = fallback
+        }
+
+        var confValues: [UInt8]? = nil
+        if let confidenceRaw, confidenceBytesPerRow >= width {
+            var arr = [UInt8](repeating: 0, count: width * height)
+            confidenceRaw.withUnsafeBytes { cBuf in
+                guard let cBase = cBuf.baseAddress else { return }
+                for y in 0..<height {
+                    let rowOff = y * confidenceBytesPerRow
+                    guard rowOff + width <= cBuf.count else { break }
+                    let rowPtr = cBase.advanced(by: rowOff).assumingMemoryBound(to: UInt8.self)
+                    let dstOff = y * width
+                    for x in 0..<width {
+                        arr[dstOff + x] = rowPtr[x]
+                    }
+                }
+            }
+            confValues = arr
+        }
+
+        return DepthSnapshot(
+            width: width,
+            height: height,
+            depthMillimeters: mmValues,
+            confidence: confValues
+        )
+    }
+}
+
 /// Cópia leve dos buffers de profundidade e confiança para evitar reter `ARFrame` em memória.
 struct DepthSnapshot: Sendable {
     let width: Int
@@ -81,22 +185,12 @@ struct DepthSnapshot: Sendable {
             return nil
         }
         let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
-        let cy = height / 2
-        let cx = width / 2
-
-        var sum: Float = 0
-        var count = 0
-        for dy in -2...2 {
-            let rowPtr = base.advanced(by: (cy + dy) * bytesPerRow).assumingMemoryBound(to: Float32.self)
-            for dx in -2...2 {
-                let d = rowPtr[cx + dx]
-                if d.isFinite && d > 0.05 && d < 12.0 {
-                    sum += d
-                    count += 1
-                }
-            }
-        }
-        return count > 0 ? (sum / Float(count)) : nil
+        return LidupRustCore.centerDepthMeters(
+            depthBase: UnsafeRawPointer(base),
+            bytesPerRow: bytesPerRow,
+            width: width,
+            height: height
+        )
     }
 }
 

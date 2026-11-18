@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,8 +11,17 @@ from typing import Any
 import numpy as np
 import open3d as o3d
 from PIL import Image
-from scipy.ndimage import maximum_filter, minimum_filter
+from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter, minimum_filter, uniform_filter, zoom
 from scipy.spatial.transform import Rotation
+
+from ._rust_bridge import (
+    rust_colorize_hires_frame,
+    rust_extract_depth_points,
+    rust_mvs_sweep,
+    rust_resize_rgb_u8_to_f64,
+    rust_upsample_depth_guided,
+    rust_warp_rgb_to_depth,
+)
 
 
 @dataclass
@@ -142,6 +153,48 @@ class _ExtractedFrame:
     img_w: int
     img_h: int
     poses_differ: bool
+    gyro_deg_s: float | None = None
+    rgb_hi_u8: np.ndarray | None = None
+
+
+def _load_imu_gyro_map(bundle: LidupBundle) -> dict[str, float]:
+    """Lê `imu.csv` (100 Hz) e associa a velocidade angular (deg/s) mais próxima a cada frame."""
+    imu_path = bundle.root / "imu.csv"
+    if not imu_path.exists():
+        return {}
+    ts_list: list[float] = []
+    gyro_list: list[float] = []
+    with imu_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                ts = float(row["timestamp_s"])
+                gx = float(row["gx"])
+                gy = float(row["gy"])
+                gz = float(row["gz"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            ts_list.append(ts)
+            gyro_list.append(float(np.degrees(np.sqrt(gx * gx + gy * gy + gz * gz))))
+    if not ts_list:
+        return {}
+    ts_arr = np.asarray(ts_list, dtype=np.float64)
+    g_arr = np.asarray(gyro_list, dtype=np.float64)
+    order = np.argsort(ts_arr)
+    ts_arr = ts_arr[order]
+    g_arr = g_arr[order]
+
+    out: dict[str, float] = {}
+    for fr in bundle.frames:
+        lo_i = int(np.searchsorted(ts_arr, fr.timestamp_s - 0.025, side="left"))
+        hi_i = int(np.searchsorted(ts_arr, fr.timestamp_s + 0.025, side="right"))
+        if hi_i > lo_i:
+            out[fr.frame_id] = float(np.median(g_arr[lo_i:hi_i]))
+        else:
+            idx = min(max(int(np.searchsorted(ts_arr, fr.timestamp_s)), 0), len(g_arr) - 1)
+            if abs(ts_arr[idx] - fr.timestamp_s) <= 0.25:
+                out[fr.frame_id] = float(g_arr[idx])
+    return out
 
 
 def _compute_incidence_cos(pts_cam_grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -174,6 +227,10 @@ def _upsample_depth_guided_by_rgb(
     """
     d_h, d_w = depth_m.shape[:2]
     u_h, u_w = rgb_hi.shape[:2]
+
+    rust_res = rust_upsample_depth_guided(depth_m, valid_lo, conf, rgb_lo, rgb_hi, int(scale), float(edge_jump_m))
+    if rust_res is not None:
+        return rust_res[0], rust_res[1], rgb_hi
 
     if edge_jump_m > 0 and np.any(valid_lo):
         d_hi_nb = maximum_filter(np.where(valid_lo, depth_m, 0.0), size=3)
@@ -268,6 +325,122 @@ def _estimate_orbit_focus_point(poses: list[np.ndarray]) -> np.ndarray | None:
     return focus if np.all(np.isfinite(focus)) else None
 
 
+def _filter_floor_mirror_outliers(
+    extracted: list[_ExtractedFrame],
+    poses: list[np.ndarray],
+) -> tuple[list[_ExtractedFrame], list[np.ndarray], float | None]:
+    """
+    Detecta piso plano dominante (ex.: cerâmica/mesa) e remove quadros ou raios espelhados
+    que aparecem abaixo do piso por reflexão especular do feixe 940 nm.
+    """
+    if len(extracted) < 5:
+        return extracted, poses, None
+
+    all_y = np.concatenate(
+        [(ext.cam_pts[::4] @ p[:3, :3].T + p[:3, 3])[:, 1] for ext, p in zip(extracted, poses) if len(ext.cam_pts) > 0]
+    )
+    if len(all_y) < 80:
+        return extracted, poses, None
+
+    y_lo, y_hi = float(np.percentile(all_y, 1.0)), float(np.percentile(all_y, 99.0))
+    span = y_hi - y_lo
+    if span < 0.04:
+        return extracted, poses, None
+
+    n_bins = max(20, min(120, int(np.ceil(span / 0.015))))
+    hist, edges = np.histogram(all_y, bins=n_bins, range=(y_lo, y_hi))
+    pk = int(np.argmax(hist))
+    if hist[pk] < max(100, int(0.20 * len(all_y))):
+        return extracted, poses, None
+
+    floor_y = float(0.5 * (edges[pk] + edges[pk + 1]))
+    clean_ext: list[_ExtractedFrame] = []
+    clean_poses: list[np.ndarray] = []
+
+    for ext, pose in zip(extracted, poses):
+        w = ext.cam_pts @ pose[:3, :3].T + pose[:3, 3]
+        if len(w) == 0:
+            continue
+        if float(np.mean(w[:, 1] >= floor_y - 0.04)) < 0.50:
+            continue
+        keep = w[:, 1] >= floor_y - 0.03
+        if np.any(~keep) and np.count_nonzero(keep) >= 50:
+            ext.depth_filtered_m[ext.v_idx[~keep], ext.u_idx[~keep]] = 0.0
+            ext.cam_pts = ext.cam_pts[keep]
+            ext.weights = ext.weights[keep]
+            ext.v_idx = ext.v_idx[keep]
+            ext.u_idx = ext.u_idx[keep]
+        clean_ext.append(ext)
+        clean_poses.append(pose)
+
+    if not clean_ext:
+        return extracted, poses, None
+    return clean_ext, clean_poses, floor_y
+
+
+def _refine_object_focus_point(
+    extracted: list[_ExtractedFrame],
+    poses: list[np.ndarray],
+    ray_focus: np.ndarray,
+    floor_y: float | None,
+) -> np.ndarray:
+    """Centraliza a caixa de foco exatamente no objeto acima do piso próximo ao cruzamento dos raios."""
+    if floor_y is None:
+        return ray_focus
+    pts = np.vstack([ext.cam_pts[::2] @ p[:3, :3].T + p[:3, 3] for ext, p in zip(extracted, poses)])
+    above = pts[(np.linalg.norm(pts - ray_focus, axis=1) <= 0.45) & (pts[:, 1] > floor_y + 0.015)]
+    if len(above) < 100:
+        return ray_focus
+    return 0.5 * (above.min(axis=0) + above.max(axis=0))
+
+
+def _warp_rgb_to_depth_grid(
+    rgb_hi_arr: np.ndarray,
+    depth_m_lo: np.ndarray,
+    valid_lo: np.ndarray,
+    pose_depth: np.ndarray,
+    pose_rgb: np.ndarray,
+    fx_d_hi: float,
+    fy_d_hi: float,
+    cx_d_hi: float,
+    cy_d_hi: float,
+    scale: int,
+) -> np.ndarray:
+    """Reprojeta a imagem RGB para a pose exata da câmera LiDAR quando houve rotação entre capturas."""
+    d_h_hi, d_w_hi = rgb_hi_arr.shape[:2]
+    med_d = float(np.median(depth_m_lo[valid_lo])) if np.any(valid_lo) else 1.0
+    d_filled = np.where(valid_lo, depth_m_lo, med_d)
+    d_hi = zoom(d_filled, float(scale), order=1)
+    if d_hi.shape != (d_h_hi, d_w_hi):
+        d_hi = d_hi[:d_h_hi, :d_w_hi]
+
+    rel_rgb_from_d = np.linalg.inv(pose_rgb) @ pose_depth
+    warped_rust = rust_warp_rgb_to_depth(
+        rgb_hi_arr,
+        d_hi,
+        rel_rgb_from_d,
+        fx_d_hi,
+        fy_d_hi,
+        cx_d_hi,
+        cy_d_hi,
+    )
+    if warped_rust is not None:
+        return warped_rust
+
+    uu, vv = np.meshgrid(np.arange(d_w_hi, dtype=np.float64), np.arange(d_h_hi, dtype=np.float64))
+    cam_d = np.stack([(uu - cx_d_hi) * d_hi / fx_d_hi, (vv - cy_d_hi) * d_hi / fy_d_hi, d_hi], axis=-1)
+
+    pts_flat = cam_d.reshape(-1, 3) @ rel_rgb_from_d[:3, :3].T + rel_rgb_from_d[:3, 3]
+    z_r = np.maximum(pts_flat[:, 2], 0.05)
+    u_r = (fx_d_hi * (pts_flat[:, 0] / z_r) + cx_d_hi).reshape(d_h_hi, d_w_hi)
+    v_r = (fy_d_hi * (pts_flat[:, 1] / z_r) + cy_d_hi).reshape(d_h_hi, d_w_hi)
+
+    warped = np.empty_like(rgb_hi_arr)
+    for ch in range(3):
+        warped[:, :, ch] = map_coordinates(rgb_hi_arr[:, :, ch], [v_r, u_r], order=1, mode="nearest")
+    return np.clip(warped, 0.0, 1.0)
+
+
 def _extract_frame_points(
     bundle: LidupBundle,
     frame: FrameRecord,
@@ -280,6 +453,7 @@ def _extract_frame_points(
     ref_img_w: int,
     ref_img_h: int,
     depth_upsample: int = 1,
+    cache_hires_rgb: bool = False,
 ) -> _ExtractedFrame | None:
     if not frame.depth_file:
         return None
@@ -307,11 +481,18 @@ def _extract_frame_points(
     pose_depth = frame.depth_t_wc if frame.depth_t_wc is not None else frame.t_wc
     poses_differ = frame.depth_t_wc is not None and not np.allclose(frame.depth_t_wc, frame.t_wc, atol=1e-4)
     pose_sync_ok = True
+    needs_rgb_warp = False
     if poses_differ:
         rel_tf = np.linalg.inv(pose_depth) @ frame.t_wc
         trans_diff = float(np.linalg.norm(rel_tf[:3, 3]))
         rot_diff_deg = float(np.degrees(np.arccos(np.clip((np.trace(rel_tf[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))))
-        pose_sync_ok = trans_diff <= 0.02 and rot_diff_deg <= 0.5
+        if trans_diff <= 0.008 and rot_diff_deg <= 0.15:
+            pose_sync_ok = True
+        elif trans_diff <= 0.15 and rot_diff_deg <= 8.0:
+            needs_rgb_warp = True
+            pose_sync_ok = True
+        else:
+            pose_sync_ok = False
 
     rgb_arr: np.ndarray | None = None
     img_w = frame.img_w if (frame.img_w and frame.img_w > 0) else ref_img_w
@@ -320,20 +501,63 @@ def _extract_frame_points(
     d_h, d_w = d_h_lo, d_w_lo
     mask = base_mask
 
+    rgb_hi_u8_cached: np.ndarray | None = None
     if frame.image_file:
         img_path = bundle.root / frame.image_file
         if img_path.exists():
             with Image.open(img_path) as im:
                 rgb_im = im.convert("RGB")
                 img_w, img_h = rgb_im.size
-                rgb_lo_im = rgb_im.resize((d_w_lo, d_h_lo), Image.Resampling.BILINEAR) if (img_w, img_h) != (d_w_lo, d_h_lo) else rgb_im
-                rgb_lo_arr = np.asarray(rgb_lo_im, dtype=np.float64) / 255.0
-
+                hi_u8 = np.asarray(rgb_im, dtype=np.uint8)
+                if cache_hires_rgb:
+                    rgb_hi_u8_cached = hi_u8
                 if eff_scale > 1 and pose_sync_ok:
                     d_w_hi = d_w_lo * eff_scale
                     d_h_hi = d_h_lo * eff_scale
-                    rgb_hi_im = rgb_im.resize((d_w_hi, d_h_hi), Image.Resampling.BILINEAR) if (img_w, img_h) != (d_w_hi, d_h_hi) else rgb_im
-                    rgb_hi_arr = np.asarray(rgb_hi_im, dtype=np.float64) / 255.0
+                    rgb_hi_arr = (
+                        rust_resize_rgb_u8_to_f64(hi_u8, d_w_hi, d_h_hi)
+                        if (img_w, img_h) != (d_w_hi, d_h_hi)
+                        else hi_u8.astype(np.float64) / 255.0
+                    )
+                    if rgb_hi_arr is None:
+                        rgb_hi_im = rgb_im.resize((d_w_hi, d_h_hi), Image.Resampling.BILINEAR)
+                        rgb_hi_arr = np.asarray(rgb_hi_im, dtype=np.float64) / 255.0
+                    if needs_rgb_warp:
+                        sx_w = d_w_hi / float(max(img_w, 1))
+                        sy_w = d_h_hi / float(max(img_h, 1))
+                        rgb_hi_arr = _warp_rgb_to_depth_grid(
+                            rgb_hi_arr,
+                            depth_m,
+                            base_mask,
+                            pose_depth,
+                            frame.t_wc,
+                            frame.fx * sx_w,
+                            frame.fy * sy_w,
+                            frame.cx * sx_w,
+                            frame.cy * sy_w,
+                            eff_scale,
+                        )
+                        rgb_lo_arr = rust_resize_rgb_u8_to_f64(
+                            np.clip(rgb_hi_arr * 255.0, 0.0, 255.0).astype(np.uint8),
+                            d_w_lo,
+                            d_h_lo,
+                        )
+                        if rgb_lo_arr is None:
+                            rgb_lo_im = Image.fromarray(np.clip(rgb_hi_arr * 255.0, 0.0, 255.0).astype(np.uint8)).resize(
+                                (d_w_lo, d_h_lo), Image.Resampling.BILINEAR
+                            )
+                            rgb_lo_arr = np.asarray(rgb_lo_im, dtype=np.float64) / 255.0
+                        poses_differ = False
+                    else:
+                        rgb_lo_arr = (
+                            rust_resize_rgb_u8_to_f64(hi_u8, d_w_lo, d_h_lo)
+                            if (img_w, img_h) != (d_w_lo, d_h_lo)
+                            else hi_u8.astype(np.float64) / 255.0
+                        )
+                        if rgb_lo_arr is None:
+                            rgb_lo_im = rgb_im.resize((d_w_lo, d_h_lo), Image.Resampling.BILINEAR)
+                            rgb_lo_arr = np.asarray(rgb_lo_im, dtype=np.float64) / 255.0
+
                     depth_m, mask, rgb_arr = _upsample_depth_guided_by_rgb(
                         depth_m,
                         base_mask,
@@ -345,15 +569,14 @@ def _extract_frame_points(
                     )
                     d_h, d_w = d_h_hi, d_w_hi
                 else:
-                    rgb_arr = rgb_lo_arr
-
-    if d_h == d_h_lo and d_w == d_w_lo and edge_jump_m > 0 and np.any(mask):
-        d_hi = maximum_filter(np.where(mask, depth_m, 0.0), size=3)
-        d_lo = minimum_filter(np.where(mask, depth_m, 1e6), size=3)
-        mask = mask & ((d_hi - d_lo) <= edge_jump_m)
-
-    if not np.any(mask):
-        return None
+                    rgb_arr = (
+                        rust_resize_rgb_u8_to_f64(hi_u8, d_w_lo, d_h_lo)
+                        if (img_w, img_h) != (d_w_lo, d_h_lo)
+                        else hi_u8.astype(np.float64) / 255.0
+                    )
+                    if rgb_arr is None:
+                        rgb_lo_im = rgb_im.resize((d_w_lo, d_h_lo), Image.Resampling.BILINEAR)
+                        rgb_arr = np.asarray(rgb_lo_im, dtype=np.float64) / 255.0
 
     if img_w <= 0 or img_h <= 0:
         img_w = max(d_w, int(round(frame.cx * 2.0)))
@@ -366,24 +589,40 @@ def _extract_frame_points(
     cx = frame.cx * sx
     cy = frame.cy * sy
 
-    uu, vv = np.meshgrid(np.arange(d_w, dtype=np.float64), np.arange(d_h, dtype=np.float64))
-    pts_grid = np.stack([(uu - cx) * depth_m / fx, (vv - cy) * depth_m / fy, depth_m], axis=-1)
-    cos_inc, n_norm = _compute_incidence_cos(pts_grid)
+    edge_pass = edge_jump_m if (d_h == d_h_lo and d_w == d_w_lo and edge_jump_m > 0) else 0.0
+    cos_thresh = float(np.cos(np.radians(max_incidence_deg))) if (max_incidence_deg is not None and 0.0 < max_incidence_deg < 89.9) else -1.0
 
-    if max_incidence_deg is not None and 0.0 < max_incidence_deg < 89.9:
-        cos_thresh = float(np.cos(np.radians(max_incidence_deg)))
-        phys_mask = mask & (cos_inc >= cos_thresh) & (n_norm > 1e-6)
-        if np.count_nonzero(phys_mask) >= max(20, int(0.15 * np.count_nonzero(mask))):
-            mask = phys_mask
+    rust_ext = rust_extract_depth_points(depth_m, mask, fx, fy, cx, cy, edge_pass, cos_thresh)
+    if rust_ext is not None:
+        mask, cam_pts, weights, v_idx, u_idx = rust_ext
+        if len(cam_pts) == 0:
+            return None
+    else:
+        if edge_pass > 0 and np.any(mask):
+            d_hi = maximum_filter(np.where(mask, depth_m, 0.0), size=3)
+            d_lo = minimum_filter(np.where(mask, depth_m, 1e6), size=3)
+            mask = mask & ((d_hi - d_lo) <= edge_pass)
 
-    if not np.any(mask):
-        return None
+        if not np.any(mask):
+            return None
 
-    v_idx, u_idx = np.nonzero(mask)
-    cam_pts = pts_grid[v_idx, u_idx]
-    z = cam_pts[:, 2]
-    cos_vals = np.clip(cos_inc[v_idx, u_idx], 0.1, 1.0)
-    weights = cos_vals / np.maximum(z, 0.30) ** 2
+        uu, vv = np.meshgrid(np.arange(d_w, dtype=np.float64), np.arange(d_h, dtype=np.float64))
+        pts_grid = np.stack([(uu - cx) * depth_m / fx, (vv - cy) * depth_m / fy, depth_m], axis=-1)
+        cos_inc, n_norm = _compute_incidence_cos(pts_grid)
+
+        if cos_thresh > 0.0:
+            phys_mask = mask & (cos_inc >= cos_thresh) & (n_norm > 1e-6)
+            if np.count_nonzero(phys_mask) >= max(20, int(0.15 * np.count_nonzero(mask))):
+                mask = phys_mask
+
+        if not np.any(mask):
+            return None
+
+        v_idx, u_idx = np.nonzero(mask)
+        cam_pts = pts_grid[v_idx, u_idx]
+        z = cam_pts[:, 2]
+        cos_vals = np.clip(cos_inc[v_idx, u_idx], 0.1, 1.0)
+        weights = cos_vals / np.maximum(z, 0.30) ** 2
 
     depth_filtered_m = np.where(mask, depth_m, 0.0).astype(np.float32)
 
@@ -405,6 +644,7 @@ def _extract_frame_points(
         img_w=img_w,
         img_h=img_h,
         poses_differ=poses_differ,
+        rgb_hi_u8=rgb_hi_u8_cached,
     )
 
 
@@ -494,7 +734,9 @@ def _refine_poses_posegraph(
     if n < 2:
         return poses_init
 
-    ds_voxel = max(0.025, float(voxel_size_m) if voxel_size_m > 0 else 0.03)
+    fine_mode = voxel_size_m > 0 and voxel_size_m <= 0.015
+    ds_voxel = max(0.008, float(voxel_size_m)) if fine_mode else max(0.025, float(voxel_size_m) if voxel_size_m > 0 else 0.03)
+    norm_radius = 0.04 if fine_mode else 0.12
     frame_pcds: list[o3d.geometry.PointCloud] = []
     cam_centers = np.array([p[:3, 3] for p in poses_init], dtype=np.float64)
 
@@ -505,14 +747,18 @@ def _refine_poses_posegraph(
         pcd.colors = o3d.utility.Vector3dVector(cols)
         ds = pcd.voxel_down_sample(ds_voxel)
         if len(ds.points) >= 20:
-            ds.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.12, max_nn=30))
+            ds.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=norm_radius, max_nn=30))
         frame_pcds.append(ds)
 
     pg = o3d.pipelines.registration.PoseGraph()
     for p in poses_init:
         pg.nodes.append(o3d.pipelines.registration.PoseGraphNode(p))
 
-    max_corr = 0.08
+    max_corr = 0.025 if fine_mode else 0.08
+    max_rmse = 0.015 if fine_mode else 0.045
+    max_shift = 0.08 if fine_mode else 0.35
+    max_ang = 3.5 if fine_mode else 12.0
+    max_dist_loop = 1.6 if fine_mode else 3.5
     edge_count = 0
     seq_connected: set[int] = set()
     for i in range(n):
@@ -523,21 +769,21 @@ def _refine_poses_posegraph(
                 continue
             is_odom = (j - i) <= 2
             dist_cams = float(np.linalg.norm(cam_centers[j] - cam_centers[i]))
-            if not is_odom and dist_cams > 3.5:
+            if not is_odom and dist_cams > max_dist_loop:
                 continue
 
             t_init = np.linalg.inv(poses_init[j]) @ poses_init[i]
-            if not is_odom:
-                ev = o3d.pipelines.registration.evaluate_registration(frame_pcds[i], frame_pcds[j], 0.12, t_init)
-                if ev.fitness < 0.25:
-                    continue
+            corr = max_corr if is_odom else (max_corr * 1.25)
+            ev = o3d.pipelines.registration.evaluate_registration(frame_pcds[i], frame_pcds[j], corr * 1.4, t_init)
+            if not is_odom and ev.fitness < (0.35 if fine_mode else 0.25):
+                continue
 
-            corr = max_corr if is_odom else 0.10
             reg = _register_pair(frame_pcds[i], frame_pcds[j], t_init, max_corr_m=corr, use_color=use_color)
             delta = reg.transformation @ np.linalg.inv(t_init)
             shift = float(np.linalg.norm(delta[:3, 3]))
             ang_deg = float(np.degrees(np.arccos(np.clip((np.trace(delta[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))))
-            if reg.fitness >= 0.35 and reg.inlier_rmse <= 0.045 and shift <= 0.35 and ang_deg <= 12.0:
+            improves_vio = (not fine_mode) or (ev.fitness < 0.2) or (reg.inlier_rmse <= max(ev.inlier_rmse, 0.004) * 1.02)
+            if reg.fitness >= (0.45 if fine_mode else 0.35) and reg.inlier_rmse <= max_rmse and shift <= max_shift and ang_deg <= max_ang and improves_vio:
                 info = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
                     frame_pcds[i], frame_pcds[j], corr, reg.transformation
                 )
@@ -574,7 +820,29 @@ def _refine_poses_posegraph(
             reference_node=0,
         ),
     )
-    return [np.array(pg.nodes[i].pose, dtype=np.float64) for i in range(n)]
+    poses_pg = [np.array(pg.nodes[i].pose, dtype=np.float64) for i in range(n)]
+
+    # Auto-verificação física: se o ICP deslizou sobre piso plano/liso e piorou o alinhamento do ARKit, descarta
+    if fine_mode:
+        step = max(1, (n - 1) // 20)
+        eval_d = max(0.015, max_corr)
+        rms_before, fit_before, rms_after, fit_after = [], [], [], []
+        for i in range(0, n - 1, step):
+            if len(frame_pcds[i].points) < 30 or len(frame_pcds[i + 1].points) < 30:
+                continue
+            tf0 = np.linalg.inv(poses_init[i + 1]) @ poses_init[i]
+            tf1 = np.linalg.inv(poses_pg[i + 1]) @ poses_pg[i]
+            ev0 = o3d.pipelines.registration.evaluate_registration(frame_pcds[i], frame_pcds[i + 1], eval_d, tf0)
+            ev1 = o3d.pipelines.registration.evaluate_registration(frame_pcds[i], frame_pcds[i + 1], eval_d, tf1)
+            if ev0.fitness > 0.1 and ev1.fitness > 0.1:
+                rms_before.append(ev0.inlier_rmse)
+                fit_before.append(ev0.fitness)
+                rms_after.append(ev1.inlier_rmse)
+                fit_after.append(ev1.fitness)
+        if rms_before and (np.mean(rms_after) > np.mean(rms_before) * 1.01 or np.mean(fit_after) < np.mean(fit_before) * 0.96):
+            return poses_init
+
+    return poses_pg
 
 
 def _prepare_extracted_and_poses(
@@ -589,7 +857,10 @@ def _prepare_extracted_and_poses(
     max_incidence_deg: float | None,
     mode: str,
     depth_upsample: int = 1,
-) -> tuple[list[_ExtractedFrame], list[np.ndarray]]:
+    hires_only: bool = False,
+    filter_mirror_floor: bool = False,
+    cache_hires_rgb: bool = False,
+) -> tuple[list[_ExtractedFrame], list[np.ndarray], float | None]:
     cfg = bundle.manifest.get("capture_config", {})
     ref_img_w = int(cfg.get("image_width") or 0)
     ref_img_h = int(cfg.get("image_height") or 0)
@@ -603,13 +874,20 @@ def _prepare_extracted_and_poses(
                     ref_img_w, ref_img_h = im.size
                 break
 
-    extracted: list[_ExtractedFrame] = []
-    for idx, frame in enumerate(bundle.frames):
-        if idx % max(1, frame_stride) != 0:
-            continue
-        ext = _extract_frame_points(
+    frames_src = bundle.frames
+    if hires_only:
+        hi_frames = [f for f in bundle.frames if f.image_file and (bundle.root / f.image_file).exists()]
+        if len(hi_frames) >= 6:
+            frames_src = hi_frames
+
+    selected_frames = [frame for idx, frame in enumerate(frames_src) if idx % max(1, frame_stride) == 0]
+    allow_ram_cache = cache_hires_rgb and len(selected_frames) <= 96
+    imu_gyro_map = _load_imu_gyro_map(bundle)
+
+    def _worker(fr: FrameRecord) -> _ExtractedFrame | None:
+        return _extract_frame_points(
             bundle,
-            frame,
+            fr,
             min_confidence=min_confidence,
             min_depth_m=min_depth_m,
             max_depth_m=max_depth_m,
@@ -618,12 +896,28 @@ def _prepare_extracted_and_poses(
             ref_img_w=ref_img_w,
             ref_img_h=ref_img_h,
             depth_upsample=depth_upsample,
+            cache_hires_rgb=allow_ram_cache,
         )
+
+    extracted: list[_ExtractedFrame] = []
+    max_workers = min(8, os.cpu_count() or 4)
+    if len(selected_frames) >= 4 and max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(_worker, selected_frames))
+    else:
+        results = [_worker(fr) for fr in selected_frames]
+
+    for fr, ext in zip(selected_frames, results):
         if ext is not None:
+            ext.gyro_deg_s = imu_gyro_map.get(fr.frame_id)
             extracted.append(ext)
 
     if not extracted:
-        return [], []
+        return [], [], None
+
+    floor_y: float | None = None
+    if filter_mirror_floor:
+        extracted, _, floor_y = _filter_floor_mirror_outliers(extracted, [ext.pose_depth for ext in extracted])
 
     if mode in {"posegraph", "colored_icp"}:
         refined_poses = _refine_poses_posegraph(
@@ -634,7 +928,7 @@ def _prepare_extracted_and_poses(
     else:
         refined_poses = [ext.pose_depth for ext in extracted]
 
-    return extracted, refined_poses
+    return extracted, refined_poses, floor_y
 
 
 def _colorize_from_hires_rgb(
@@ -646,27 +940,75 @@ def _colorize_from_hires_rgb(
     fallback_colors: np.ndarray,
     *,
     max_depth_m: float,
+    occ_tol_m: float = 0.05,
 ) -> np.ndarray:
     """
-    Projeta vértices/pontos finais diretamente nas fotos 12 MP (uma por vez na RAM),
-    escolhendo o frame mais próximo/frontal com teste de oclusão contra o mapa LiDAR.
+    Projeta vértices/pontos finais diretamente nas fotos 12 MP (uma por vez na RAM)
+    com interpolação bilinear subpixel, escolhendo o frame mais próximo/frontal/nítido
+    com teste de oclusão contra o mapa LiDAR.
     """
     if len(points_arkit) == 0:
         return fallback_colors
 
     best_score = np.full(len(points_arkit), -1.0, dtype=np.float64)
     out_colors = fallback_colors.copy()
+    sharp_vals = [ext.frame.sharpness for ext in extracted if ext.frame.sharpness > 0]
+    med_sharp = float(np.median(sharp_vals)) if sharp_vals else 0.0
 
     for ext, pose in zip(extracted, refined_poses):
-        if not ext.frame.image_file:
-            continue
-        img_path = bundle.root / ext.frame.image_file
-        if not img_path.exists():
-            continue
-
         # Mantém offset relativo RGB<->Depth quando PoseGraph ajustou a pose do frame
         rel_rgb = np.linalg.inv(ext.pose_depth) @ ext.frame.t_wc
         pose_rgb = pose @ rel_rgb
+
+        sharp_w = 1.0
+        if med_sharp > 0 and ext.frame.sharpness > 0:
+            sharp_w = float(np.clip(np.sqrt(ext.frame.sharpness / med_sharp), 0.6, 1.4))
+        imu_w = 1.0
+        if ext.gyro_deg_s is not None:
+            imu_w = float(np.clip(20.0 / max(ext.gyro_deg_s, 12.0), 0.55, 1.30))
+
+        hi_u8 = ext.rgb_hi_u8
+        if hi_u8 is None:
+            if not ext.frame.image_file:
+                continue
+            img_path = bundle.root / ext.frame.image_file
+            if not img_path.exists():
+                continue
+
+            cam_z_pre = (points_arkit[:, 0] - pose_rgb[0, 3]) * pose_rgb[0, 2] + (
+                points_arkit[:, 1] - pose_rgb[1, 3]
+            ) * pose_rgb[1, 2] + (points_arkit[:, 2] - pose_rgb[2, 3]) * pose_rgb[2, 2]
+            if not np.any((cam_z_pre > 0.20) & (cam_z_pre <= max_depth_m)):
+                continue
+
+            with Image.open(img_path) as im:
+                hi_u8 = np.asarray(im.convert("RGB"), dtype=np.uint8)
+
+        hi_h, hi_w = hi_u8.shape[:2]
+        sx = hi_w / float(max(ext.img_w, 1))
+        sy = hi_h / float(max(ext.img_h, 1))
+        fx_hi = ext.frame.fx * sx
+        fy_hi = ext.frame.fy * sy
+        cx_hi = ext.frame.cx * sx
+        cy_hi = ext.frame.cy * sy
+
+        if rust_colorize_hires_frame(
+            points_arkit,
+            normals_arkit,
+            pose_rgb,
+            hi_u8,
+            ext.depth_filtered_m,
+            fx_hi,
+            fy_hi,
+            cx_hi,
+            cy_hi,
+            max_depth_m,
+            occ_tol_m,
+            sharp_w * imu_w,
+            best_score,
+            out_colors,
+        ):
+            continue
 
         cam = (points_arkit - pose_rgb[:3, 3]) @ pose_rgb[:3, :3]
         z = cam[:, 2]
@@ -674,53 +1016,55 @@ def _colorize_from_hires_rgb(
         if not np.any(in_range):
             continue
 
-        with Image.open(img_path) as im:
-            hi_w, hi_h = im.size
-            sx = hi_w / float(max(ext.img_w, 1))
-            sy = hi_h / float(max(ext.img_h, 1))
-            fx_hi = ext.frame.fx * sx
-            fy_hi = ext.frame.fy * sy
-            cx_hi = ext.frame.cx * sx
-            cy_hi = ext.frame.cy * sy
+        safe_z = np.where(in_range, z, 1.0)
+        u_f = fx_hi * (cam[:, 0] / safe_z) + cx_hi
+        v_f = fy_hi * (cam[:, 1] / safe_z) + cy_hi
+        inside = in_range & (u_f >= 0.0) & (u_f <= hi_w - 1.001) & (v_f >= 0.0) & (v_f <= hi_h - 1.001)
+        if not np.any(inside):
+            continue
 
-            safe_z = np.where(in_range, z, 1.0)
-            u_hi = np.rint(fx_hi * (cam[:, 0] / safe_z) + cx_hi).astype(np.int64)
-            v_hi = np.rint(fy_hi * (cam[:, 1] / safe_z) + cy_hi).astype(np.int64)
-            inside = in_range & (u_hi >= 0) & (u_hi < hi_w) & (v_hi >= 0) & (v_hi < hi_h)
-            if not np.any(inside):
-                continue
+        idx_cand = np.nonzero(inside)[0]
+        u_d = np.clip(np.rint(u_f[idx_cand] * (ext.d_w / float(hi_w))).astype(np.int64), 0, ext.d_w - 1)
+        v_d = np.clip(np.rint(v_f[idx_cand] * (ext.d_h / float(hi_h))).astype(np.int64), 0, ext.d_h - 1)
+        d_obs = ext.depth_filtered_m[v_d, u_d]
+        not_occluded = (d_obs > 0.0) & (np.abs(z[idx_cand] - d_obs) <= occ_tol_m)
+        idx_vis = idx_cand[not_occluded]
+        if len(idx_vis) == 0:
+            continue
 
-            idx_cand = np.nonzero(inside)[0]
-            u_d = np.clip(np.rint(u_hi[idx_cand] * (ext.d_w / float(hi_w))).astype(np.int64), 0, ext.d_w - 1)
-            v_d = np.clip(np.rint(v_hi[idx_cand] * (ext.d_h / float(hi_h))).astype(np.int64), 0, ext.d_h - 1)
-            d_obs = ext.depth_filtered_m[v_d, u_d]
-            not_occluded = (d_obs > 0.0) & (np.abs(z[idx_cand] - d_obs) <= 0.05)
-            idx_vis = idx_cand[not_occluded]
-            if len(idx_vis) == 0:
-                continue
+        view_dir = -cam[idx_vis] / np.maximum(np.linalg.norm(cam[idx_vis], axis=1, keepdims=True), 1e-8)
+        if normals_arkit is not None and len(normals_arkit) == len(points_arkit):
+            norms_cam = normals_arkit[idx_vis] @ pose_rgb[:3, :3]
+            cos_v = np.sum(norms_cam * view_dir, axis=1)
+            facing = cos_v > 0.20
+            idx_vis = idx_vis[facing]
+            cos_v = cos_v[facing]
+        else:
+            cos_v = np.clip(z[idx_vis] / np.maximum(np.linalg.norm(cam[idx_vis], axis=1), 1e-8), 0.1, 1.0)
 
-            view_dir = -cam[idx_vis] / np.maximum(np.linalg.norm(cam[idx_vis], axis=1, keepdims=True), 1e-8)
-            if normals_arkit is not None and len(normals_arkit) == len(points_arkit):
-                norms_cam = normals_arkit[idx_vis] @ pose_rgb[:3, :3]
-                cos_v = np.sum(norms_cam * view_dir, axis=1)
-                facing = cos_v > 0.20
-                idx_vis = idx_vis[facing]
-                cos_v = cos_v[facing]
-            else:
-                cos_v = np.clip(z[idx_vis] / np.maximum(np.linalg.norm(cam[idx_vis], axis=1), 1e-8), 0.1, 1.0)
+        if len(idx_vis) == 0:
+            continue
 
-            if len(idx_vis) == 0:
-                continue
+        scores = (cos_v * sharp_w * imu_w) / np.maximum(z[idx_vis], 0.25) ** 2
+        better = scores > best_score[idx_vis]
+        idx_win = idx_vis[better]
+        if len(idx_win) == 0:
+            continue
 
-            scores = cos_v / np.maximum(z[idx_vis], 0.30) ** 2
-            better = scores > best_score[idx_vis]
-            idx_win = idx_vis[better]
-            if len(idx_win) == 0:
-                continue
-
-            hi_arr = np.asarray(im.convert("RGB"), dtype=np.float64) / 255.0
-            out_colors[idx_win] = hi_arr[v_hi[idx_win], u_hi[idx_win]]
-            best_score[idx_win] = scores[better]
+        hi_arr = hi_u8.astype(np.float64) / 255.0
+        uw = u_f[idx_win]
+        vw = v_f[idx_win]
+        u0 = np.floor(uw).astype(np.int64)
+        v0 = np.floor(vw).astype(np.int64)
+        du = (uw - u0)[:, None]
+        dv = (vw - v0)[:, None]
+        c00 = hi_arr[v0, u0]
+        c10 = hi_arr[v0, u0 + 1]
+        c01 = hi_arr[v0 + 1, u0]
+        c11 = hi_arr[v0 + 1, u0 + 1]
+        interp = c00 * (1.0 - du) * (1.0 - dv) + c10 * du * (1.0 - dv) + c01 * (1.0 - du) * dv + c11 * du * dv
+        out_colors[idx_win] = interp
+        best_score[idx_win] = scores[better]
 
     return np.clip(out_colors, 0.0, 1.0)
 
@@ -750,7 +1094,7 @@ def reconstruct_lidar_point_cloud(
     if mode not in {"none", "posegraph", "colored_icp", "legacy_icp"}:
         raise ValueError(f"Modo pose_refine inválido: {mode}")
 
-    extracted, refined_poses = _prepare_extracted_and_poses(
+    extracted, refined_poses, _ = _prepare_extracted_and_poses(
         bundle,
         min_confidence=min_confidence,
         min_depth_m=min_depth_m,
@@ -761,6 +1105,7 @@ def reconstruct_lidar_point_cloud(
         max_incidence_deg=max_incidence_deg,
         mode=mode,
         depth_upsample=depth_upsample,
+        cache_hires_rgb=hires_color,
     )
     if not extracted:
         return o3d.geometry.PointCloud()
@@ -825,6 +1170,8 @@ def reconstruct_lidar_point_cloud(
             merged_cols,
             max_depth_m=max_depth_m,
         )
+    for ext in extracted:
+        ext.rgb_hi_u8 = None
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(merged_pts)
@@ -836,6 +1183,253 @@ def reconstruct_lidar_point_cloud(
     return pcd
 
 
+def _refine_depth_mvs(
+    extracted: list[_ExtractedFrame],
+    poses: list[np.ndarray],
+    *,
+    max_shift_m: float = 0.012,
+    n_steps: int = 11,
+) -> None:
+    """
+    Estéreo Multi-Visão guiado pelo LiDAR (LiDAR-Seeded MVS):
+    refina cada mapa de profundidade buscando pequenos deslocamentos dz em [-12, +12] mm
+    que maximizam ZNCC fotométrico contra quadros vizinhos, modulando pela textura local
+    para recuperar micro-relevos reais sem criar ruído em áreas lisas.
+    """
+    rgb_indices = [i for i, e in enumerate(extracted) if e.rgb_arr is not None and np.any(e.depth_filtered_m > 0.0)]
+    if len(rgb_indices) < 3:
+        return
+
+    norm_hp: dict[int, np.ndarray] = {}
+    local_std: dict[int, np.ndarray] = {}
+    for i in rgb_indices:
+        rgb = extracted[i].rgb_arr
+        gray = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+        hp = gray - uniform_filter(gray, size=7)
+        var = uniform_filter(hp * hp, size=7)
+        local_std[i] = np.sqrt(np.maximum(var, 0.0))
+        norm_hp[i] = hp / np.sqrt(var + 1e-4)
+
+    cam_centers = {i: poses[i][:3, 3] for i in rgb_indices}
+    cam_fwd = {i: poses[i][:3, 2] / max(float(np.linalg.norm(poses[i][:3, 2])), 1e-8) for i in rgb_indices}
+    dz_grid = np.linspace(-float(max_shift_m), float(max_shift_m), max(5, int(n_steps)))
+    step_m = float(dz_grid[1] - dz_grid[0])
+
+    new_depths: dict[int, np.ndarray] = {}
+    for i in rgb_indices:
+        ext = extracted[i]
+        d0 = ext.depth_filtered_m.astype(np.float64)
+        valid = d0 > 0.0
+        if np.count_nonzero(valid) < 80:
+            continue
+
+        # Escolhe até 4 quadros vizinhos com bom paralaxe (baseline 0.08..0.48 m) e vista concordante
+        cands: list[tuple[float, int]] = []
+        for j in rgb_indices:
+            if j == i:
+                continue
+            dist = float(np.linalg.norm(cam_centers[j] - cam_centers[i]))
+            cos_v = float(np.dot(cam_fwd[j], cam_fwd[i]))
+            if dist < 0.05 or cos_v < 0.60:
+                continue
+            # Prefere baseline perto de 0.22 m e quadro com menor rotação na IMU
+            gyro_pen = 1.0 + 0.02 * (extracted[j].gyro_deg_s or 15.0)
+            score_nb = (abs(dist - 0.22) + (0.4 if dist < 0.08 or dist > 0.50 else 0.0)) * gyro_pen
+            cands.append((score_nb, j))
+        if not cands:
+            continue
+        cands.sort(key=lambda x: x[0])
+        neighbors = [j for _, j in cands[:4]]
+
+        d_h, d_w = d0.shape
+        pose_i = poses[i]
+        t_nb_list = [(j, np.linalg.inv(poses[j]) @ pose_i) for j in neighbors]
+        ref_nhp = norm_hp[i]
+
+        rust_mvs = rust_mvs_sweep(
+            d0,
+            valid,
+            ref_nhp,
+            float(ext.fx),
+            float(ext.fy),
+            float(ext.cx),
+            float(ext.cy),
+            [norm_hp[j] for j, _ in t_nb_list],
+            [extracted[j].depth_filtered_m for j, _ in t_nb_list],
+            [tf for _, tf in t_nb_list],
+            [(extracted[j].d_w, extracted[j].d_h) for j, _ in t_nb_list],
+            [(float(extracted[j].fx), float(extracted[j].fy), float(extracted[j].cx), float(extracted[j].cy)) for j, _ in t_nb_list],
+            float(max_shift_m),
+            len(dz_grid),
+        )
+
+        if rust_mvs is not None:
+            dz_raw, best_score, best_vis = rust_mvs
+        else:
+            uu, vv = np.meshgrid(np.arange(d_w, dtype=np.float64), np.arange(d_h, dtype=np.float64))
+            ray_x = (uu - ext.cx) / ext.fx
+            ray_y = (vv - ext.cy) / ext.fy
+
+            score_vol = np.zeros((len(dz_grid), d_h, d_w), dtype=np.float32)
+            vis_vol = np.zeros((len(dz_grid), d_h, d_w), dtype=np.float32)
+
+            for k_idx, dz in enumerate(dz_grid):
+                d_cand = np.where(valid, np.maximum(0.15, d0 + dz), 0.0)
+                pts_i = np.stack([ray_x * d_cand, ray_y * d_cand, d_cand], axis=-1)
+                pts_flat = pts_i[valid]
+
+                sum_corr = np.zeros((d_h, d_w), dtype=np.float64)
+                cnt_vis = np.zeros((d_h, d_w), dtype=np.float64)
+
+                for j, tf in t_nb_list:
+                    ext_j = extracted[j]
+                    p_j = pts_flat @ tf[:3, :3].T + tf[:3, 3]
+                    z_j = p_j[:, 2]
+                    in_z = z_j > 0.15
+                    safe_z = np.where(in_z, z_j, 1.0)
+                    u_j = ext_j.fx * (p_j[:, 0] / safe_z) + ext_j.cx
+                    v_j = ext_j.fy * (p_j[:, 1] / safe_z) + ext_j.cy
+                    in_b = in_z & (u_j >= 0.0) & (u_j <= ext_j.d_w - 1.001) & (v_j >= 0.0) & (v_j <= ext_j.d_h - 1.001)
+                    if not np.any(in_b):
+                        continue
+
+                    uj_i = np.clip(np.rint(u_j[in_b]).astype(np.int64), 0, ext_j.d_w - 1)
+                    vj_i = np.clip(np.rint(v_j[in_b]).astype(np.int64), 0, ext_j.d_h - 1)
+                    dj_obs = ext_j.depth_filtered_m[vj_i, uj_i]
+                    occ_ok = (dj_obs <= 0.0) | (np.abs(z_j[in_b] - dj_obs) <= 0.04)
+
+                    warped_nb = np.zeros((d_h, d_w), dtype=np.float64)
+                    vis_mask = np.zeros((d_h, d_w), dtype=bool)
+
+                    valid_indices = np.nonzero(valid)
+                    in_b_idx = np.nonzero(in_b)[0][occ_ok]
+                    if len(in_b_idx) == 0:
+                        continue
+
+                    vr_sel = valid_indices[0][in_b_idx]
+                    ur_sel = valid_indices[1][in_b_idx]
+                    sampled = map_coordinates(norm_hp[j], [v_j[in_b_idx], u_j[in_b_idx]], order=1, mode="nearest")
+                    warped_nb[vr_sel, ur_sel] = sampled
+                    vis_mask[vr_sel, ur_sel] = True
+
+                    corr = uniform_filter(ref_nhp * warped_nb, size=5)
+                    sum_corr += np.where(vis_mask, np.maximum(corr, 0.0), 0.0)
+                    cnt_vis += vis_mask
+
+                score_vol[k_idx] = (sum_corr / np.maximum(cnt_vis, 1.0)).astype(np.float32)
+                vis_vol[k_idx] = cnt_vis.astype(np.float32)
+
+            best_k = np.argmax(score_vol, axis=0)
+            best_score = np.take_along_axis(score_vol, best_k[None, :, :], axis=0)[0].astype(np.float64)
+            best_vis = np.take_along_axis(vis_vol, best_k[None, :, :], axis=0)[0].astype(np.float64)
+
+            k_m = np.clip(best_k - 1, 0, len(dz_grid) - 1)
+            k_p = np.clip(best_k + 1, 0, len(dz_grid) - 1)
+            s_m = np.take_along_axis(score_vol, k_m[None, :, :], axis=0)[0].astype(np.float64)
+            s_p = np.take_along_axis(score_vol, k_p[None, :, :], axis=0)[0].astype(np.float64)
+            denom = 2.0 * (s_m - 2.0 * best_score + s_p)
+            interior = (best_k > 0) & (best_k < len(dz_grid) - 1) & (denom < -1e-4)
+            sub_off = np.where(interior, np.clip((s_m - s_p) / np.where(interior, denom, -1.0), -0.5, 0.5), 0.0)
+            dz_raw = dz_grid[best_k] + sub_off * step_m
+
+        tex_w = np.clip((local_std[i] - 0.015) / 0.035, 0.0, 1.0)
+        corr_w = np.clip((best_score - 0.30) / 0.40, 0.0, 1.0)
+        alpha = np.where(valid & (best_vis >= 1.0), tex_w * corr_w, 0.0)
+        dz_smooth = gaussian_filter(dz_raw * alpha, sigma=0.8) / np.maximum(gaussian_filter(alpha, sigma=0.8), 1e-4)
+        new_depths[i] = np.where(valid, d0 + alpha * np.clip(dz_smooth, -max_shift_m, max_shift_m), 0.0)
+
+    for i, d_new in new_depths.items():
+        ext = extracted[i]
+        mask = d_new > 0.0
+        if not np.any(mask):
+            continue
+        rust_re = rust_extract_depth_points(d_new, mask, ext.fx, ext.fy, ext.cx, ext.cy, 0.0, -1.0)
+        if rust_re is not None:
+            _, cam_pts, weights, v_idx, u_idx = rust_re
+            if len(cam_pts) == 0:
+                continue
+        else:
+            d_h, d_w = d_new.shape
+            uu, vv = np.meshgrid(np.arange(d_w, dtype=np.float64), np.arange(d_h, dtype=np.float64))
+            pts_grid = np.stack([(uu - ext.cx) * d_new / ext.fx, (vv - ext.cy) * d_new / ext.fy, d_new], axis=-1)
+            cos_inc, _ = _compute_incidence_cos(pts_grid)
+            v_idx, u_idx = np.nonzero(mask)
+            cam_pts = pts_grid[v_idx, u_idx]
+            weights = np.clip(cos_inc[v_idx, u_idx], 0.1, 1.0) / np.maximum(cam_pts[:, 2], 0.30) ** 2
+
+        ext.cam_pts = cam_pts
+        ext.v_idx = v_idx
+        ext.u_idx = u_idx
+        ext.weights = weights
+        ext.depth_filtered_m = d_new.astype(np.float32)
+
+
+def _optimize_photometric_colormap(
+    mesh: o3d.geometry.TriangleMesh,
+    extracted: list[_ExtractedFrame],
+    poses: list[np.ndarray],
+    *,
+    max_depth_m: float,
+    max_iter: int = 80,
+) -> tuple[o3d.geometry.TriangleMesh, list[np.ndarray]]:
+    """
+    Executa ajuste fotométrico rígido (Open3D ColorMapOptimizer) refinando as poses
+    das câmeras diretamente sobre as bordas visuais da malha 3D.
+    """
+    rgb_indices = [i for i, e in enumerate(extracted) if e.rgb_arr is not None and len(e.cam_pts) > 50]
+    if len(rgb_indices) < 2 or len(mesh.triangles) == 0:
+        return mesh, poses
+
+    rgbd_images: list[o3d.geometry.RGBDImage] = []
+    traj = o3d.camera.PinholeCameraTrajectory()
+    params: list[o3d.camera.PinholeCameraParameters] = []
+    for i in rgb_indices:
+        ext = extracted[i]
+        color_u8 = np.clip(ext.rgb_arr * 255.0, 0.0, 255.0).astype(np.uint8)
+        depth_mm = np.clip(np.rint(ext.depth_filtered_m * 1000.0), 0.0, 65535.0).astype(np.uint16)
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(np.ascontiguousarray(color_u8)),
+            o3d.geometry.Image(np.ascontiguousarray(depth_mm)),
+            depth_scale=1000.0,
+            depth_trunc=float(max_depth_m),
+            convert_rgb_to_intensity=False,
+        )
+        rgbd_images.append(rgbd)
+
+        param = o3d.camera.PinholeCameraParameters()
+        param.intrinsic = o3d.camera.PinholeCameraIntrinsic(ext.d_w, ext.d_h, ext.fx, ext.fy, ext.cx, ext.cy)
+        param.extrinsic = np.linalg.inv(poses[i])
+        params.append(param)
+    traj.parameters = params
+
+    option = o3d.pipelines.color_map.RigidOptimizerOption(
+        maximum_iteration=int(max_iter),
+        maximum_allowable_depth=float(max_depth_m),
+        depth_threshold_for_visibility_check=0.025,
+        depth_threshold_for_discontinuity_check=0.08,
+        half_dilation_kernel_size_for_discontinuity_map=2,
+        image_boundary_margin=6,
+        invisible_vertex_color_knn=3,
+    )
+    try:
+        mesh_opt, traj_opt = o3d.pipelines.color_map.run_rigid_optimizer(
+            o3d.geometry.TriangleMesh(mesh), rgbd_images, traj, option
+        )
+    except RuntimeError:
+        return mesh, poses
+
+    out_poses = [p.copy() for p in poses]
+    for slot, i in enumerate(rgb_indices):
+        ext_mat = np.asarray(traj_opt.parameters[slot].extrinsic, dtype=np.float64)
+        pose_opt = np.linalg.inv(ext_mat)
+        delta = pose_opt @ np.linalg.inv(poses[i])
+        shift = float(np.linalg.norm(delta[:3, 3]))
+        ang_deg = float(np.degrees(np.arccos(np.clip((np.trace(delta[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))))
+        if np.all(np.isfinite(pose_opt)) and shift <= 0.03 and ang_deg <= 2.5:
+            out_poses[i] = pose_opt
+    return mesh_opt, out_poses
+
+
 def _integrate_uniform_tsdf(
     extracted: list[_ExtractedFrame],
     refined_poses: list[np.ndarray],
@@ -844,12 +1438,12 @@ def _integrate_uniform_tsdf(
     res: int,
     vox: float,
     max_depth_m: float,
-) -> o3d.geometry.TriangleMesh:
+) -> tuple[o3d.geometry.TriangleMesh, float]:
     actual_vox = length / float(res)
     volume = o3d.pipelines.integration.UniformTSDFVolume(
         length=length,
         resolution=res,
-        sdf_trunc=max(0.03, actual_vox * 4.5),
+        sdf_trunc=max(0.008, min(0.035, actual_vox * 6.0)),
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
     )
 
@@ -874,7 +1468,128 @@ def _integrate_uniform_tsdf(
 
     mesh = volume.extract_triangle_mesh()
     mesh.translate(lo, relative=True)
-    return mesh
+    return mesh, actual_vox
+
+
+def reconstruct_tsdf_details(
+    bundle: LidupBundle,
+    *,
+    min_confidence: int = 2,
+    min_depth_m: float = 0.30,
+    max_depth_m: float = 4.50,
+    tsdf_voxel_m: float = 0.008,
+    frame_stride: int = 1,
+    edge_jump_m: float = 0.12,
+    refine_poses: bool = True,
+    pose_refine: str | None = None,
+    max_incidence_deg: float | None = 75.0,
+    hires_color: bool = True,
+    depth_upsample: int = 2,
+    focus_radius_m: float | None = None,
+    hires_only: bool = True,
+    use_mvs: bool = False,
+    photometric_opt: bool = False,
+) -> tuple[o3d.geometry.PointCloud, o3d.geometry.TriangleMesh, list[_ExtractedFrame], list[np.ndarray]]:
+    """
+    Funde múltiplos quadros em uma malha 3D contínua via UniformTSDFVolume com super-resolução
+    de profundidade guiada pelo RGB (depth_upsample), refinamento estéreo multi-visão (MVS)
+    opcional e otimização fotométrica sobre os JPEGs 12 MP, retornando também os quadros
+    e poses refinadas para texturização UV.
+    """
+    mode = pose_refine if pose_refine is not None else ("posegraph" if refine_poses else "none")
+    if mode not in {"none", "posegraph", "colored_icp"}:
+        mode = "posegraph" if refine_poses else "none"
+
+    pose_voxel = max(tsdf_voxel_m * 2.5, 0.008) if (focus_radius_m is not None or tsdf_voxel_m <= 0.006) else max(tsdf_voxel_m * 3.0, 0.02)
+    extracted, refined_poses, floor_y = _prepare_extracted_and_poses(
+        bundle,
+        min_confidence=min_confidence,
+        min_depth_m=min_depth_m,
+        max_depth_m=max_depth_m,
+        voxel_size_m=pose_voxel,
+        frame_stride=frame_stride,
+        edge_jump_m=edge_jump_m,
+        max_incidence_deg=max_incidence_deg,
+        mode=mode,
+        depth_upsample=depth_upsample,
+        hires_only=hires_only,
+        filter_mirror_floor=(focus_radius_m is not None),
+        cache_hires_rgb=hires_color,
+    )
+    if not extracted:
+        return o3d.geometry.PointCloud(), o3d.geometry.TriangleMesh(), [], []
+
+    if use_mvs:
+        _refine_depth_mvs(extracted, refined_poses)
+
+    vox = max(0.0008, float(tsdf_voxel_m))
+    max_res = 480
+    mesh = o3d.geometry.TriangleMesh()
+    actual_vox = vox
+
+    if focus_radius_m is not None and focus_radius_m > 0.15:
+        ray_focus = _estimate_orbit_focus_point(refined_poses)
+        if ray_focus is not None:
+            focus = _refine_object_focus_point(extracted, refined_poses, ray_focus, floor_y)
+            r = float(focus_radius_m)
+            lo_focus = focus - r
+            length_focus = max(0.36, 2.0 * r)
+            res_focus = min(max_res, max(64, int(np.ceil(length_focus / vox))))
+            mesh, actual_vox = _integrate_uniform_tsdf(extracted, refined_poses, lo_focus, length_focus, res_focus, vox, max_depth_m)
+
+    if len(mesh.vertices) == 0:
+        world_samples = np.vstack(
+            [
+                ext.cam_pts[:: max(1, len(ext.cam_pts) // 250)] @ pose[:3, :3].T + pose[:3, 3]
+                for ext, pose in zip(extracted, refined_poses)
+            ]
+        )
+        lo = np.percentile(world_samples, 0.5, axis=0) - 0.30
+        hi = np.percentile(world_samples, 99.5, axis=0) + 0.30
+        length = max(1.0, float(np.max(hi - lo)))
+        res = min(max_res, max(64, int(np.ceil(length / vox))))
+        mesh, actual_vox = _integrate_uniform_tsdf(extracted, refined_poses, lo, length, res, vox, max_depth_m)
+
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    if len(mesh.vertices) > 0 and actual_vox <= 0.0045 and not use_mvs:
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=2)
+    mesh.compute_vertex_normals()
+
+    if photometric_opt and len(mesh.triangles) > 0:
+        mesh, refined_poses = _optimize_photometric_colormap(
+            mesh, extracted, refined_poses, max_depth_m=max_depth_m
+        )
+        mesh.compute_vertex_normals()
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    norms = np.asarray(mesh.vertex_normals, dtype=np.float64)
+    cols = np.asarray(mesh.vertex_colors, dtype=np.float64)
+    if len(cols) != len(verts):
+        cols = np.full((len(verts), 3), 0.65, dtype=np.float64)
+
+    occ_tol = 0.025 if (focus_radius_m is not None and focus_radius_m <= 1.0) else 0.045
+    if hires_color and len(verts) > 0:
+        cols = _colorize_from_hires_rgb(
+            bundle,
+            verts,
+            norms,
+            extracted,
+            refined_poses,
+            cols,
+            max_depth_m=max_depth_m,
+            occ_tol_m=occ_tol,
+        )
+        mesh.vertex_colors = o3d.utility.Vector3dVector(cols)
+
+    for ext in extracted:
+        ext.rgb_hi_u8 = None
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(verts)
+    pcd.colors = o3d.utility.Vector3dVector(cols)
+    return pcd, mesh, extracted, refined_poses
 
 
 def reconstruct_tsdf_mesh(
@@ -892,81 +1607,27 @@ def reconstruct_tsdf_mesh(
     hires_color: bool = True,
     depth_upsample: int = 2,
     focus_radius_m: float | None = None,
+    hires_only: bool = True,
+    use_mvs: bool = False,
+    photometric_opt: bool = False,
 ) -> tuple[o3d.geometry.PointCloud, o3d.geometry.TriangleMesh]:
-    """
-    Funde múltiplos quadros em uma malha 3D contínua via UniformTSDFVolume com super-resolução
-    de profundidade guiada pelo RGB (depth_upsample) e foco automático opcional em torno
-    do centro de convergência dos raios de visão 360°, pintando os vértices pelas fotos 12 MP.
-    """
-    mode = pose_refine if pose_refine is not None else ("posegraph" if refine_poses else "none")
-    if mode not in {"none", "posegraph", "colored_icp"}:
-        mode = "posegraph" if refine_poses else "none"
-
-    extracted, refined_poses = _prepare_extracted_and_poses(
+    """Compat wrapper que retorna apenas `(PointCloud, TriangleMesh)`."""
+    pcd, mesh, _, _ = reconstruct_tsdf_details(
         bundle,
         min_confidence=min_confidence,
         min_depth_m=min_depth_m,
         max_depth_m=max_depth_m,
-        voxel_size_m=max(tsdf_voxel_m * 3.0, 0.02),
+        tsdf_voxel_m=tsdf_voxel_m,
         frame_stride=frame_stride,
         edge_jump_m=edge_jump_m,
+        refine_poses=refine_poses,
+        pose_refine=pose_refine,
         max_incidence_deg=max_incidence_deg,
-        mode=mode,
+        hires_color=hires_color,
         depth_upsample=depth_upsample,
+        focus_radius_m=focus_radius_m,
+        hires_only=hires_only,
+        use_mvs=use_mvs,
+        photometric_opt=photometric_opt,
     )
-    if not extracted:
-        return o3d.geometry.PointCloud(), o3d.geometry.TriangleMesh()
-
-    vox = max(0.004, float(tsdf_voxel_m))
-    max_res = 400
-    mesh = o3d.geometry.TriangleMesh()
-
-    if focus_radius_m is not None and focus_radius_m > 0.25:
-        focus = _estimate_orbit_focus_point(refined_poses)
-        if focus is not None:
-            r = float(focus_radius_m)
-            lo_focus = focus - r
-            length_focus = max(0.8, 2.0 * r)
-            res_focus = min(max_res, max(64, int(np.ceil(length_focus / vox))))
-            mesh = _integrate_uniform_tsdf(extracted, refined_poses, lo_focus, length_focus, res_focus, vox, max_depth_m)
-
-    if len(mesh.vertices) == 0:
-        world_samples = np.vstack(
-            [
-                ext.cam_pts[:: max(1, len(ext.cam_pts) // 250)] @ pose[:3, :3].T + pose[:3, 3]
-                for ext, pose in zip(extracted, refined_poses)
-            ]
-        )
-        lo = np.percentile(world_samples, 0.5, axis=0) - 0.30
-        hi = np.percentile(world_samples, 99.5, axis=0) + 0.30
-        length = max(1.0, float(np.max(hi - lo)))
-        res = min(max_res, max(64, int(np.ceil(length / vox))))
-        mesh = _integrate_uniform_tsdf(extracted, refined_poses, lo, length, res, vox, max_depth_m)
-
-    mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_vertices()
-    mesh.remove_non_manifold_edges()
-    mesh.compute_vertex_normals()
-
-    verts = np.asarray(mesh.vertices, dtype=np.float64)
-    norms = np.asarray(mesh.vertex_normals, dtype=np.float64)
-    cols = np.asarray(mesh.vertex_colors, dtype=np.float64)
-    if len(cols) != len(verts):
-        cols = np.full((len(verts), 3), 0.65, dtype=np.float64)
-
-    if hires_color and len(verts) > 0:
-        cols = _colorize_from_hires_rgb(
-            bundle,
-            verts,
-            norms,
-            extracted,
-            refined_poses,
-            cols,
-            max_depth_m=max_depth_m,
-        )
-        mesh.vertex_colors = o3d.utility.Vector3dVector(cols)
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(verts)
-    pcd.colors = o3d.utility.Vector3dVector(cols)
     return pcd, mesh

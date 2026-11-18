@@ -17,6 +17,8 @@ from scipy.ndimage import median_filter
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, mapping
 
+from ._rust_bridge import rust_csf_cloth_filter
+
 
 @dataclass
 class TerrainRaster:
@@ -90,6 +92,16 @@ def _csf_ground_surface(
     gy, gx = np.mgrid[0:ny, 0:nx]
     terrain_filled = terrain_grid.copy()
     terrain_filled[~valid_mask] = interp_nn(gx[~valid_mask], gy[~valid_mask])
+
+    rust_dtm = rust_csf_cloth_filter(
+        terrain_filled,
+        float(z_inv.max()),
+        int(rigidness),
+        int(iterations),
+        float(gravity_step_m),
+    )
+    if rust_dtm is not None:
+        return rust_dtm
 
     cloth = np.full((ny, nx), float(z_inv.max()) + 0.25, dtype=np.float64)
     passes = max(1, min(3, int(rigidness)))

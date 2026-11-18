@@ -86,6 +86,8 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
     private var lastTrackedPosition: SIMD3<Float>?
     private var latestCameraTransform: simd_float4x4?
     private var isCapturingStill = false
+    private var stillDepthRing: [(timestamp: TimeInterval, transform: simd_float4x4, raw: RawDepthSnapshot)] = []
+    private var focusLockTask: Task<Void, Never>?
     private var bestSharpness: Float = 0
     private var frameCounter = 0
 
@@ -140,8 +142,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
         var semantics: ARConfiguration.FrameSemantics = []
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             semantics.insert(.sceneDepth)
-        }
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
             semantics.insert(.smoothedSceneDepth)
         }
         config.frameSemantics = semantics
@@ -152,7 +153,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
         config.worldAlignment = (capturePreset == .object3DGS) ? .gravity : .gravityAndHeading
 
         arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
-        applyOpticsLockIfNeeded(lock: lockCameraOptics)
+        applyOpticsLockIfNeeded(lock: false)
     }
 
     func applyPreset(_ preset: CapturePreset) {
@@ -213,9 +214,20 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
             lastTrackedPosition = nil
             gcpPoints = []
             scaleBars = []
+            stillDepthRing = []
+            focusLockTask?.cancel()
             isRecording = true
             motionProvider.setIMUWriter(writer)
-            applyOpticsLockIfNeeded(lock: lockCameraOptics)
+            if lockCameraOptics {
+                applyOpticsLockIfNeeded(lock: false)
+                focusLockTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    guard let self, !Task.isCancelled, self.isRecording, self.lockCameraOptics else { return }
+                    self.applyOpticsLockIfNeeded(lock: true)
+                }
+            } else {
+                applyOpticsLockIfNeeded(lock: false)
+            }
             lastStatusMessage = "Gravação iniciada em \(writer?.sessionId ?? "")"
         } catch {
             lastStatusMessage = "Erro ao iniciar pacote: \(error.localizedDescription)"
@@ -224,6 +236,10 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
 
     func stopRecording() {
         isRecording = false
+        focusLockTask?.cancel()
+        focusLockTask = nil
+        stillDepthRing.removeAll(keepingCapacity: false)
+        applyOpticsLockIfNeeded(lock: false)
         motionProvider.setIMUWriter(nil)
         gcpTask?.cancel()
         isCollectingGCP = false
@@ -359,6 +375,16 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
         }
         lastTrackedPosition = currentPos
 
+        // Enquanto o still de 12 MP está em voo (~60–180ms), guarda até 5 snapshots brutos de LiDAR para emparelhar <8ms.
+        if isCapturingStill,
+           let depthSrc = frame.sceneDepth ?? frame.smoothedSceneDepth,
+           let raw = RawDepthSnapshot.captureRaw(from: depthSrc.depthMap, confidenceMap: depthSrc.confidenceMap) {
+            stillDepthRing.append((timestamp: frame.timestamp, transform: currentTransform, raw: raw))
+            if stillDepthRing.count > 5 {
+                stillDepthRing.removeFirst(stillDepthRing.count - 5)
+            }
+        }
+
         let hiResDue: Bool = {
             guard let lastT = lastKeyframeTransform else { return true }
             return hasMovedEnough(from: lastT, to: currentTransform, minDist: minTranslationM, minAngleDeg: minRotationDeg)
@@ -382,15 +408,20 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
 
         if shouldTriggerHiRes {
             pendingHiResSince = nil
-            // Usa `sceneDepth` instantâneo do mesmo `ARFrame` e guarda sua pose exata `t0` para não dessincronizar ao girar.
+            // Captura snapshot bruto instantâneo (memcpy rápido, conversão Float32→UInt16 ocorre fora da MainActor no BundleWriter).
             let depthSourceT0 = frame.sceneDepth ?? frame.smoothedSceneDepth
-            let depthSnapshotT0: DepthSnapshot? = depthSourceT0.flatMap {
-                DepthSnapshot.capture(from: $0.depthMap, confidenceMap: $0.confidenceMap)
+            let rawDepthT0: RawDepthSnapshot? = depthSourceT0.flatMap {
+                RawDepthSnapshot.captureRaw(from: $0.depthMap, confidenceMap: $0.confidenceMap)
             }
             let depthTransformT0 = currentTransform
             let gnssSnapshot = locationProvider.latestSample
             let fallbackIntrinsics = frame.camera.intrinsics
             let fallbackTimestamp = frame.timestamp
+
+            stillDepthRing.removeAll(keepingCapacity: true)
+            if let rawDepthT0 {
+                stillDepthRing.append((timestamp: frame.timestamp, transform: currentTransform, raw: rawDepthT0))
+            }
 
             lastKeyframeTransform = currentTransform
             lastDepthBurstTransform = currentTransform
@@ -398,9 +429,13 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
             isCapturingStill = true
 
             session.captureHighResolutionFrame { [weak self] hiResFrame, _ in
+                let preSharpness: Float? = hiResFrame.flatMap { SharpnessMeter.score($0.capturedImage) }
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    defer { self.isCapturingStill = false }
+                    defer {
+                        self.stillDepthRing.removeAll(keepingCapacity: true)
+                        self.isCapturingStill = false
+                    }
                     guard self.isRecording else { return }
 
                     let liveNow = self.arSession.currentFrame
@@ -411,17 +446,38 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
                     let chosenIntrinsics = hiResFrame?.camera.intrinsics ?? liveNow?.camera.intrinsics ?? fallbackIntrinsics
                     let chosenTimestamp = hiResFrame?.timestamp ?? liveNow?.timestamp ?? fallbackTimestamp
 
-                    var chosenDepth = depthSnapshotT0
+                    var chosenRawDepth = rawDepthT0
                     var chosenDepthTransform = depthTransformT0
-                    if let liveNow,
-                       abs(liveNow.timestamp - chosenTimestamp) < 0.045,
+                    var bestDelta = abs(fallbackTimestamp - chosenTimestamp)
+                    for entry in self.stillDepthRing {
+                        let delta = abs(entry.timestamp - chosenTimestamp)
+                        if delta < bestDelta {
+                            bestDelta = delta
+                            chosenRawDepth = entry.raw
+                            chosenDepthTransform = entry.transform
+                        }
+                    }
+                    if bestDelta > 0.012,
+                       let liveNow,
+                       abs(liveNow.timestamp - chosenTimestamp) < bestDelta,
                        let liveDepth = liveNow.sceneDepth ?? liveNow.smoothedSceneDepth,
-                       let freshDepth = DepthSnapshot.capture(from: liveDepth.depthMap, confidenceMap: liveDepth.confidenceMap) {
-                        chosenDepth = freshDepth
+                       let freshRaw = RawDepthSnapshot.captureRaw(from: liveDepth.depthMap, confidenceMap: liveDepth.confidenceMap) {
+                        chosenRawDepth = freshRaw
                         chosenDepthTransform = liveNow.camera.transform
                     }
 
-                    let sharpness = SharpnessMeter.score(chosenBuffer) ?? 0
+                    let camDev = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera
+                    let rawExposure = camDev?.exposureDuration.seconds
+                    let exposureS = (rawExposure?.isFinite == true) ? rawExposure : nil
+                    let isoVal = camDev?.iso
+                    let lensPos = camDev?.lensPosition
+
+                    let sharpness: Float
+                    if let preSharpness {
+                        sharpness = preSharpness
+                    } else {
+                        sharpness = SharpnessMeter.score(chosenBuffer) ?? 0
+                    }
                     if self.blurRejectionEnabled && self.savedFrameCount >= 5 {
                         if self.bestSharpness > 0 && sharpness < self.bestSharpness * 0.45 {
                             self.rejectedBlurCount += 1
@@ -445,8 +501,11 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
                         intrinsics: chosenIntrinsics,
                         sharpness: sharpness,
                         trackingStateLabel: "normal",
-                        depthSnapshot: chosenDepth,
-                        gnss: gnssSnapshot
+                        rawDepth: chosenRawDepth,
+                        gnss: gnssSnapshot,
+                        exposureSeconds: exposureS,
+                        iso: isoVal,
+                        lensPosition: lensPos
                     )
                 }
             }
@@ -464,12 +523,16 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
                minAngleDeg: max(2.5, minRotationDeg * 0.50)
            ),
            let depthSource = frame.sceneDepth ?? frame.smoothedSceneDepth,
-           let depthSnapshot = DepthSnapshot.capture(from: depthSource.depthMap, confidenceMap: depthSource.confidenceMap) {
+           let rawBurstDepth = RawDepthSnapshot.captureRaw(from: depthSource.depthMap, confidenceMap: depthSource.confidenceMap) {
             let idx = frameCounter
             frameCounter += 1
             savedDepthOnlyCount += 1
             lastDepthBurstTransform = currentTransform
             lastDepthBurstTimestamp = frame.timestamp
+
+            let camDev = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera
+            let rawExposure = camDev?.exposureDuration.seconds
+            let exposureS = (rawExposure?.isFinite == true) ? rawExposure : nil
 
             activeWriter.appendKeyframe(
                 frameIndex: idx,
@@ -481,8 +544,11 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
                 intrinsics: frame.camera.intrinsics,
                 sharpness: 0,
                 trackingStateLabel: "normal",
-                depthSnapshot: depthSnapshot,
-                gnss: locationProvider.latestSample
+                rawDepth: rawBurstDepth,
+                gnss: locationProvider.latestSample,
+                exposureSeconds: exposureS,
+                iso: camDev?.iso,
+                lensPosition: camDev?.lensPosition
             )
         }
     }
@@ -490,17 +556,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
     // MARK: - Helpers
 
     private func hasMovedEnough(from previous: simd_float4x4, to current: simd_float4x4, minDist: Float, minAngleDeg: Float) -> Bool {
-        let p0 = SIMD3<Float>(previous.columns.3.x, previous.columns.3.y, previous.columns.3.z)
-        let p1 = SIMD3<Float>(current.columns.3.x, current.columns.3.y, current.columns.3.z)
-        if simd_distance(p0, p1) >= minDist {
-            return true
-        }
-
-        let f0 = simd_normalize(-SIMD3<Float>(previous.columns.2.x, previous.columns.2.y, previous.columns.2.z))
-        let f1 = simd_normalize(-SIMD3<Float>(current.columns.2.x, current.columns.2.y, current.columns.2.z))
-        let cosine = max(-1.0 as Float, min(1.0 as Float, simd_dot(f0, f1)))
-        let minRotRad = minAngleDeg * .pi / 180.0
-        return acos(cosine) >= minRotRad
+        LidupRustCore.se3HasMovedEnough(from: previous, to: current, minDistM: minDist, minAngleDeg: minAngleDeg)
     }
 
     private static func describeTracking(_ state: ARCamera.TrackingState) -> (String, Bool) {

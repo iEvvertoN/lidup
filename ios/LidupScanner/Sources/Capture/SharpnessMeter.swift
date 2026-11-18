@@ -16,54 +16,30 @@ enum SharpnessMeter {
         switch format {
         case kCVPixelFormatType_32BGRA:
             guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
-            return gradientEnergy(
-                base: base,
+            return LidupRustCore.sharpnessLaplacianBGRA(
+                bgraBase: UnsafeRawPointer(base),
                 bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
                 width: width,
                 height: height,
-                bytesPerPixel: 4,
-                channelOffset: 1
+                sampleStep: 4
             )
 
         case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
              kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
             guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return nil }
-            return gradientEnergy(
-                base: base,
-                bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(buffer, 0),
-                width: CVPixelBufferGetWidthOfPlane(buffer, 0),
-                height: CVPixelBufferGetHeightOfPlane(buffer, 0),
-                bytesPerPixel: 1,
-                channelOffset: 0
+            let planeW = CVPixelBufferGetWidthOfPlane(buffer, 0)
+            let planeH = CVPixelBufferGetHeightOfPlane(buffer, 0)
+            let planeStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+            return LidupRustCore.sharpnessLaplacian(
+                yPlaneBase: UnsafeRawPointer(base),
+                bytesPerRow: planeStride,
+                width: planeW,
+                height: planeH,
+                sampleStep: 4
             )
 
         default:
             return nil
         }
-    }
-
-    private static func gradientEnergy(
-        base: UnsafeMutableRawPointer,
-        bytesPerRow: Int,
-        width: Int,
-        height: Int,
-        bytesPerPixel: Int,
-        channelOffset: Int
-    ) -> Float {
-        var total: Double = 0
-        var samples = 0
-
-        for row in stride(from: 0, to: height, by: 4) {
-            let rowBase = base.advanced(by: row * bytesPerRow).assumingMemoryBound(to: UInt8.self)
-            for column in stride(from: 0, to: width - 1, by: 2) {
-                let left = Int(rowBase[column * bytesPerPixel + channelOffset])
-                let right = Int(rowBase[(column + 1) * bytesPerPixel + channelOffset])
-                let diff = Double(right - left)
-                total += diff * diff
-                samples += 1
-            }
-        }
-
-        return samples > 0 ? Float(total / Double(samples)) : 0
     }
 }

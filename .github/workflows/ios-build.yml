@@ -5,10 +5,12 @@ on:
     branches: [ main, master ]
     paths:
       - "ios/**"
+      - "core/lidup_core/**"
       - ".github/workflows/ios-build.yml"
   pull_request:
     paths:
       - "ios/**"
+      - "core/lidup_core/**"
   workflow_dispatch:
 
 jobs:
@@ -17,6 +19,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Build Rust lidup_core staticlib (aarch64-apple-ios)
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup target add aarch64-apple-ios
+          cargo test --manifest-path core/lidup_core/Cargo.toml
+          cargo build --manifest-path core/lidup_core/Cargo.toml --release --target aarch64-apple-ios
 
       - name: Install XcodeGen
         run: brew install xcodegen

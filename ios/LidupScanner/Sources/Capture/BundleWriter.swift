@@ -6,6 +6,14 @@ import Metal
 import UIKit
 import simd
 
+/// Wrapper seguro para despachar `CVPixelBuffer` de foto hi-res para codificação JPEG em background.
+private final class PixelBufferBox: @unchecked Sendable {
+    let buffer: CVPixelBuffer
+    init(_ buffer: CVPixelBuffer) {
+        self.buffer = buffer
+    }
+}
+
 /// Cópia segura dos buffers Metal de um `ARMeshAnchor` para escrita em background.
 private struct MeshAnchorCopy: Sendable {
     let transform: simd_float4x4
@@ -90,7 +98,7 @@ final class BundleWriter: @unchecked Sendable {
             gnssSource: "apple_core_location"
         )
 
-        let framesHeader = "frame_id,timestamp_s,image_file,depth_file,confidence_file,tx,ty,tz,qx,qy,qz,qw,fx,fy,cx,cy,sharpness,tracking_state,lat,lon,alt_m,h_acc_m,v_acc_m,depth_tx,depth_ty,depth_tz,depth_qx,depth_qy,depth_qz,depth_qw,img_w,img_h\n"
+        let framesHeader = "frame_id,timestamp_s,image_file,depth_file,confidence_file,tx,ty,tz,qx,qy,qz,qw,fx,fy,cx,cy,sharpness,tracking_state,lat,lon,alt_m,h_acc_m,v_acc_m,depth_tx,depth_ty,depth_tz,depth_qx,depth_qy,depth_qz,depth_qw,img_w,img_h,exposure_s,iso,lens_pos\n"
         try framesHeader.write(to: framesURL, atomically: true, encoding: .utf8)
         self.framesHandle = try FileHandle(forWritingTo: framesURL)
         try self.framesHandle?.seekToEnd()
@@ -158,54 +166,55 @@ final class BundleWriter: @unchecked Sendable {
         intrinsics: simd_float3x3,
         sharpness: Float,
         trackingStateLabel: String,
-        depthSnapshot: DepthSnapshot?,
-        gnss: GNSSSample?
+        depthSnapshot: DepthSnapshot? = nil,
+        rawDepth: RawDepthSnapshot? = nil,
+        gnss: GNSSSample?,
+        exposureSeconds: Double? = nil,
+        iso: Float? = nil,
+        lensPosition: Float? = nil
     ) {
         let frameId = String(format: "%06d", frameIndex)
-        var encodedJPEG: Data? = nil
-        var imgW = Int(imageSizeHint?.width ?? 0)
-        var imgH = Int(imageSizeHint?.height ?? 0)
-
-        if let pixelBuffer {
-            imgW = CVPixelBufferGetWidth(pixelBuffer)
-            imgH = CVPixelBufferGetHeight(pixelBuffer)
-
-            // Mantém orientação nativa do sensor para preservar correspondência exata com `intrinsics` e `depthMap`.
-            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-            guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-                  let jpegData = ciContext.jpegRepresentation(
-                    of: ciImage,
-                    colorSpace: colorSpace,
-                    options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.95]
-                  ) else {
-                return
-            }
-            encodedJPEG = jpegData
-        }
-
-        let finalJPEG = encodedJPEG
-        let finalImgW = imgW
-        let finalImgH = imgH
+        let bufferBox = pixelBuffer.map { PixelBufferBox($0) }
+        let finalImgW = pixelBuffer.map { CVPixelBufferGetWidth($0) } ?? Int(imageSizeHint?.width ?? 0)
+        let finalImgH = pixelBuffer.map { CVPixelBufferGetHeight($0) } ?? Int(imageSizeHint?.height ?? 0)
 
         writeQueue.async { [weak self] in
             guard let self else { return }
 
-            if finalJPEG != nil && self.manifest.captureConfig.imageWidth == 0 {
+            var encodedJPEG: Data? = nil
+            if let box = bufferBox {
+                // Codificação JPEG 12 MP fora da Main Thread preservando orientação nativa e intrinsics exatos.
+                let ciImage = CIImage(cvPixelBuffer: box.buffer)
+                if let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+                   let jpegData = self.ciContext.jpegRepresentation(
+                    of: ciImage,
+                    colorSpace: colorSpace,
+                    options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.95]
+                   ) {
+                    encodedJPEG = jpegData
+                } else {
+                    return
+                }
+            }
+
+            let resolvedDepth = depthSnapshot ?? rawDepth?.convert()
+
+            if encodedJPEG != nil && self.manifest.captureConfig.imageWidth == 0 {
                 self.manifest.captureConfig.imageWidth = finalImgW
                 self.manifest.captureConfig.imageHeight = finalImgH
-                if let depthSnapshot {
-                    self.manifest.captureConfig.depthWidth = depthSnapshot.width
-                    self.manifest.captureConfig.depthHeight = depthSnapshot.height
+                if let resolvedDepth {
+                    self.manifest.captureConfig.depthWidth = resolvedDepth.width
+                    self.manifest.captureConfig.depthHeight = resolvedDepth.height
                 }
                 try? self.persistManifestSync()
-            } else if self.manifest.captureConfig.depthWidth == 0, let depthSnapshot {
-                self.manifest.captureConfig.depthWidth = depthSnapshot.width
-                self.manifest.captureConfig.depthHeight = depthSnapshot.height
+            } else if self.manifest.captureConfig.depthWidth == 0, let resolvedDepth {
+                self.manifest.captureConfig.depthWidth = resolvedDepth.width
+                self.manifest.captureConfig.depthHeight = resolvedDepth.height
                 try? self.persistManifestSync()
             }
 
             var relImage = ""
-            if let jpegData = finalJPEG {
+            if let jpegData = encodedJPEG {
                 relImage = "images/\(frameId).jpg"
                 let imgURL = self.bundleDirectory.appendingPathComponent(relImage)
                 do {
@@ -217,19 +226,19 @@ final class BundleWriter: @unchecked Sendable {
 
             var relDepth = ""
             var relConf = ""
-            if let depthSnapshot,
+            if let resolvedDepth,
                let depthData = Png16Encoder.encode16BitDepthPNG(
-                width: depthSnapshot.width,
-                height: depthSnapshot.height,
-                values: depthSnapshot.depthMillimeters
+                width: resolvedDepth.width,
+                height: resolvedDepth.height,
+                values: resolvedDepth.depthMillimeters
                ) {
                 relDepth = "depth/\(frameId).png"
                 try? depthData.write(to: self.bundleDirectory.appendingPathComponent(relDepth), options: .atomic)
 
-                if let conf = depthSnapshot.confidence,
+                if let conf = resolvedDepth.confidence,
                    let confData = Png16Encoder.encode8BitGrayPNG(
-                    width: depthSnapshot.width,
-                    height: depthSnapshot.height,
+                    width: resolvedDepth.width,
+                    height: resolvedDepth.height,
                     values: conf
                    ) {
                     relConf = "confidence/\(frameId).png"
@@ -253,12 +262,16 @@ final class BundleWriter: @unchecked Sendable {
             let altStr = gnss.map { String(format: "%.3f", $0.altEllipsoidalM) } ?? ""
             let hAccStr = gnss.map { String(format: "%.3f", $0.hAccM) } ?? ""
             let vAccStr = gnss.map { String(format: "%.3f", $0.vAccM) } ?? ""
+            let expStr = exposureSeconds.map { String(format: "%.6f", $0) } ?? ""
+            let isoStr = iso.map { String(format: "%.1f", $0) } ?? ""
+            let lensStr = lensPosition.map { String(format: "%.4f", $0) } ?? ""
 
             let line = "\(frameId),\(String(format: "%.6f", timestampS)),\(relImage),\(relDepth),\(relConf),"
                 + "\(t.x),\(t.y),\(t.z),\(q.x),\(q.y),\(q.z),\(q.w),"
                 + "\(fx),\(fy),\(cx),\(cy),\(sharpness),\(trackingStateLabel),"
                 + "\(latStr),\(lonStr),\(altStr),\(hAccStr),\(vAccStr),"
-                + "\(dt.x),\(dt.y),\(dt.z),\(dq.x),\(dq.y),\(dq.z),\(dq.w),\(finalImgW),\(finalImgH)\n"
+                + "\(dt.x),\(dt.y),\(dt.z),\(dq.x),\(dq.y),\(dq.z),\(dq.w),\(finalImgW),\(finalImgH),"
+                + "\(expStr),\(isoStr),\(lensStr)\n"
 
             if let data = line.data(using: .utf8) {
                 try? self.framesHandle?.write(contentsOf: data)
