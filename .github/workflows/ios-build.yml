@@ -30,6 +30,8 @@ jobs:
           rustup target add aarch64-apple-ios
           cargo test --manifest-path core/lidup_core/Cargo.toml
           cargo build --manifest-path core/lidup_core/Cargo.toml --release --target aarch64-apple-ios
+          rm -f core/lidup_core/target/aarch64-apple-ios/release/*.dylib
+          ls -lh core/lidup_core/target/aarch64-apple-ios/release/liblidup_core.a
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -61,6 +63,12 @@ jobs:
           /usr/libexec/PlistBuddy -c "Print :NSLocationWhenInUseUsageDescription" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :NSMotionUsageDescription" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :UIFileSharingEnabled" "$PLIST"
+          BIN="build/Build/Products/Release-iphoneos/LidupScanner.app/LidupScanner"
+          otool -L "$BIN"
+          if otool -L "$BIN" | grep -E "lidup_core\.dylib|/Users/"; then
+            echo "ERROR: Binary dynamically links non-system dylib!"
+            exit 1
+          fi
 
       - name: Package unsigned IPA for Sideloadly
         working-directory: ios/LidupScanner
