@@ -14,16 +14,22 @@ struct LidupScannerApp: App {
     var body: some Scene {
         WindowGroup {
             TabView {
-                CaptureView(controller: captureController, locationProvider: locationProvider)
+                CaptureView(
+                    controller: captureController,
+                    locationProvider: locationProvider,
+                    externalStorage: captureController.externalStorage
+                )
                     .tabItem {
                         Label("Capturar", systemImage: "camera.metering.center.weighted")
                     }
 
-                SessionsView()
+                SessionsView(externalStorage: captureController.externalStorage)
                     .tabItem {
                         Label("Pacotes", systemImage: "folder")
                     }
             }
+            .preferredColorScheme(.dark)
+            .tint(.white)
         }
     }
 }

@@ -43,6 +43,7 @@ final class BundleWriter: @unchecked Sendable {
 
     private let writeQueue = DispatchQueue(label: "com.lidup.scanner.bundleWriter", qos: .userInitiated)
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private let customSecurityRootURL: URL?
 
     private var framesHandle: FileHandle?
     private var gnssHandle: FileHandle?
@@ -53,7 +54,13 @@ final class BundleWriter: @unchecked Sendable {
     /// Alinha o referencial da câmera ARKit (+Y cima, -Z frente) ao padrão OpenCV/Open3D (+Y baixo, +Z frente).
     private static let qAC = simd_quatf(ix: 1.0, iy: 0.0, iz: 0.0, r: 0.0)
 
-    init(sectorName: String, config: CaptureConfig, hasLidar: Bool) throws {
+    init(
+        sectorName: String,
+        config: CaptureConfig,
+        hasLidar: Bool,
+        customRootDirectory: URL? = nil,
+        securityScopedRoot: Bool = false
+    ) throws {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HHmmss"
         let timestampPrefix = formatter.string(from: Date())
@@ -65,8 +72,9 @@ final class BundleWriter: @unchecked Sendable {
         let safeSector = cleanSector.isEmpty ? "setor" : cleanSector
 
         self.sessionId = "\(timestampPrefix)_\(safeSector)"
+        self.customSecurityRootURL = securityScopedRoot ? customRootDirectory : nil
 
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let docs = customRootDirectory ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         self.bundleDirectory = docs.appendingPathComponent(sessionId, isDirectory: true)
         self.imagesDirectory = bundleDirectory.appendingPathComponent("images", isDirectory: true)
         self.depthDirectory = bundleDirectory.appendingPathComponent("depth", isDirectory: true)
@@ -79,7 +87,11 @@ final class BundleWriter: @unchecked Sendable {
         self.gcpsURL = bundleDirectory.appendingPathComponent("gcps.json")
 
         let fm = FileManager.default
-        try fm.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
+        if !(config.lidarOnly ?? false) {
+            try fm.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
+        } else {
+            try fm.createDirectory(at: bundleDirectory, withIntermediateDirectories: true)
+        }
         try fm.createDirectory(at: depthDirectory, withIntermediateDirectories: true)
         try fm.createDirectory(at: confidenceDirectory, withIntermediateDirectories: true)
 
@@ -199,17 +211,15 @@ final class BundleWriter: @unchecked Sendable {
 
             let resolvedDepth = depthSnapshot ?? rawDepth?.convert()
 
-            if encodedJPEG != nil && self.manifest.captureConfig.imageWidth == 0 {
-                self.manifest.captureConfig.imageWidth = finalImgW
-                self.manifest.captureConfig.imageHeight = finalImgH
-                if let resolvedDepth {
+            if self.manifest.captureConfig.depthWidth == 0 || (encodedJPEG != nil && self.manifest.captureConfig.imageWidth == 0) {
+                if finalImgW > 0 && self.manifest.captureConfig.imageWidth == 0 {
+                    self.manifest.captureConfig.imageWidth = finalImgW
+                    self.manifest.captureConfig.imageHeight = finalImgH
+                }
+                if let resolvedDepth, self.manifest.captureConfig.depthWidth == 0 {
                     self.manifest.captureConfig.depthWidth = resolvedDepth.width
                     self.manifest.captureConfig.depthHeight = resolvedDepth.height
                 }
-                try? self.persistManifestSync()
-            } else if self.manifest.captureConfig.depthWidth == 0, let resolvedDepth {
-                self.manifest.captureConfig.depthWidth = resolvedDepth.width
-                self.manifest.captureConfig.depthHeight = resolvedDepth.height
                 try? self.persistManifestSync()
             }
 
@@ -385,6 +395,7 @@ final class BundleWriter: @unchecked Sendable {
             self.framesHandle = nil
             self.gnssHandle = nil
             self.imuHandle = nil
+            self.customSecurityRootURL?.stopAccessingSecurityScopedResource()
             completion()
         }
     }

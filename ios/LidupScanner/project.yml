@@ -26,8 +26,8 @@ targets:
         GENERATE_INFOPLIST_FILE: "NO"
         PRODUCT_BUNDLE_IDENTIFIER: com.lidup.scanner
         PRODUCT_NAME: LidupScanner
-        MARKETING_VERSION: "0.3.0"
-        CURRENT_PROJECT_VERSION: "3"
+        MARKETING_VERSION: "0.4.0"
+        CURRENT_PROJECT_VERSION: "4"
         SWIFT_OBJC_BRIDGING_HEADER: Sources/LidupScanner-Bridging-Header.h
         HEADER_SEARCH_PATHS:
           - $(inherited)

@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-/// Returns ABI version of lidup_core (currently 2).
+/// Returns ABI version of lidup_core (currently 3).
 uint32_t lidup_core_abi_version(void);
 
 /// Converts Float32 depth buffer (meters, arbitrary byte stride) to UInt16 millimeters.
@@ -194,6 +194,30 @@ int32_t lidup_csf_cloth_filter_f64(
     int32_t iterations,
     double gravity_step_m,
     double *out_dtm_f64
+);
+
+/// Barnes Priority-Flood hydrological depression/ponding solver.
+int32_t lidup_priority_flood_ponding_f64(
+    const double *z_grid_f64,
+    const uint8_t *valid_u8,
+    int32_t nx,
+    int32_t ny,
+    double *out_water_depth_m_f64
+);
+
+/// Rotated rectangular equipment clearance + 2D sensor viewshed raycast.
+int32_t lidup_clearance_and_viewshed_u8(
+    const uint8_t *occ_u8,
+    const uint8_t *domain_u8,
+    int32_t nx,
+    int32_t ny,
+    double cell_m,
+    double half_w_m,
+    double half_d_m,
+    int32_t sensor_ix,
+    int32_t sensor_iy,
+    uint8_t *out_passable_u8,
+    uint8_t *out_visible_u8
 );
 
 #ifdef __cplusplus

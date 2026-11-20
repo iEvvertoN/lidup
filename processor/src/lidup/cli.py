@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -16,6 +17,14 @@ from .bundle import load_bundle, reconstruct_lidar_point_cloud, reconstruct_tsdf
 from .earthwork import simulate_plateau_earthwork
 from .georef import arkit_to_engineering_local, georeference_points
 from .gsplat import export_gaussian_splatting_dataset
+from .ruler import run_interactive_ruler
+from .simulations import (
+    analyze_clearance_and_viewshed,
+    compute_object_or_pile_volume,
+    detect_reflective_surfaces,
+    diff_point_clouds,
+    simulate_water_ponding,
+)
 from .synthetic import generate_synthetic_bundle
 from .texture import bake_uv_texture_obj
 from .terrain import (
@@ -127,7 +136,11 @@ def cmd_process(args: argparse.Namespace) -> None:
         mesh_path = out_dir / "object_mesh_local.ply"
         o3d.io.write_triangle_mesh(str(mesh_path), tsdf_mesh)
         generated.append(mesh_path)
-        if args.uv_texture and mesh_arkit_copy is not None and tsdf_extracted:
+        has_uv_photos = any(
+            e.frame.image_file and (bundle.root / e.frame.image_file).exists()
+            for e in tsdf_extracted
+        )
+        if args.uv_texture and mesh_arkit_copy is not None and tsdf_extracted and has_uv_photos:
             uv_obj = bake_uv_texture_obj(
                 bundle,
                 mesh_arkit_copy,
@@ -250,7 +263,24 @@ def _resolve_view_target(target: Path) -> Path:
         raise FileNotFoundError(f"Caminho não encontrado: {target}")
     if (target / "manifest.json").exists():
         return target
-    for candidate in ("object_textured.obj", "object_mesh_local.ply", "cloud_local.ply", "cloud.ply", "points3D.ply", "cloud.laz", "cloud.las", "terrain_local.obj"):
+    for candidate in (
+        "object_textured.obj",
+        "object_mesh_local.ply",
+        "cloud_local.ply",
+        "cloud_georef.ply",
+        "cloud.ply",
+        "points3D.ply",
+        "cloud.laz",
+        "cloud.las",
+        "terrain_local.obj",
+        "diff_heatmap.ply",
+        "ponding_map.ply",
+        "clearance_map.ply",
+        "viewshed_map.ply",
+        "volume_heatmap.ply",
+        "floor_flatness.ply",
+        "reflective_zones.ply",
+    ):
         p = target / candidate
         if p.exists():
             return p
@@ -422,23 +452,19 @@ def configure_view_controls(
         return True
 
     def _zoom_in(v: o3d.visualization.Visualizer) -> bool:
-        vc = v.get_view_control()
-        vc.scale(-3.0)
-        vc.camera_local_translate(move_step * 0.5, 0.0, 0.0)
-        return True
-
-    def _zoom_out(v: o3d.visualization.Visualizer) -> bool:
-        vc = v.get_view_control()
-        vc.scale(3.0)
-        vc.camera_local_translate(-move_step * 0.5, 0.0, 0.0)
-        return True
-
-    def _move_forward(v: o3d.visualization.Visualizer) -> bool:
         v.get_view_control().camera_local_translate(move_step, 0.0, 0.0)
         return True
 
-    def _move_backward(v: o3d.visualization.Visualizer) -> bool:
+    def _zoom_out(v: o3d.visualization.Visualizer) -> bool:
         v.get_view_control().camera_local_translate(-move_step, 0.0, 0.0)
+        return True
+
+    def _move_up(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_translate(0.0, 0.0, move_step)
+        return True
+
+    def _move_down(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_translate(0.0, 0.0, -move_step)
         return True
 
     def _move_left(v: o3d.visualization.Visualizer) -> bool:
@@ -449,6 +475,22 @@ def configure_view_controls(
         v.get_view_control().camera_local_translate(0.0, move_step, 0.0)
         return True
 
+    def _look_left(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_rotate(-40.0, 0.0)
+        return True
+
+    def _look_right(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_rotate(40.0, 0.0)
+        return True
+
+    def _look_up(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_rotate(0.0, -40.0)
+        return True
+
+    def _look_down(v: o3d.visualization.Visualizer) -> bool:
+        v.get_view_control().camera_local_rotate(0.0, 40.0)
+        return True
+
     def _reset_view(v: o3d.visualization.Visualizer) -> bool:
         v.reset_view_point(True)
         return True
@@ -456,17 +498,17 @@ def configure_view_controls(
     # Códigos GLFW: Setas (262..265), PageUp/PageDown (266..267)
     callbacks = {
         ord("W"): _zoom_in,
-        265: _zoom_in,       # Seta para cima
         ord("S"): _zoom_out,
-        264: _zoom_out,      # Seta para baixo
-        ord("I"): _move_forward,
-        266: _move_forward,  # PageUp
-        ord("O"): _move_backward,
-        267: _move_backward, # PageDown
         ord("A"): _move_left,
-        263: _move_left,     # Seta esquerda
         ord("D"): _move_right,
-        262: _move_right,    # Seta direita
+        ord("E"): _move_up,
+        266: _move_up,      # PageUp
+        ord("X"): _move_down,
+        267: _move_down,    # PageDown
+        265: _look_up,      # Seta para cima
+        264: _look_down,    # Seta para baixo
+        263: _look_left,    # Seta esquerda
+        262: _look_right,   # Seta direita
         ord("R"): _reset_view,
         ord("C"): _toggle_color,
     }
@@ -521,7 +563,71 @@ def cmd_analyze_room(args: argparse.Namespace) -> None:
         f"[lidup] Cômodo: {report.width_m:.2f} × {report.length_m:.2f} m | "
         f"Área piso: {report.floor_area_m2:.2f} m² | "
         f"Pé-direito ({report.ceiling_source}): {report.ceiling_height_m:.2f} m | "
-        f"Planeza piso RMS: {report.floor_flatness_rms_mm:.1f} mm (P95: {report.floor_flatness_p95_mm:.1f} mm)"
+        f"Planeza piso RMS: {report.floor_flatness_rms_mm:.1f} mm (P95: {report.floor_flatness_p95_mm:.1f} mm) | "
+        f"Prumo máx paredes: {report.max_wall_plumb_mm_per_m:.1f} mm/m"
+    )
+
+
+def cmd_diff(args: argparse.Namespace) -> None:
+    rep = diff_point_clouds(args.before, args.after, args.out, align=not args.no_align, tol_mm=args.tol_mm)
+    print(f"[lidup] Comparação 4D salva em: {args.out}")
+    print(
+        f"[lidup] Diff RMS: {rep.rms_mm:.1f} mm | P95: {rep.p95_mm:.1f} mm | Max: {rep.max_mm:.1f} mm | "
+        f"Alterado (>±{rep.tol_mm:.0f}mm): {rep.changed_pct:.1f}% (+{rep.added_pct:.1f}% / -{rep.removed_pct:.1f}%) | "
+        f"Volume líquido: {rep.net_volume_m3:+.3f} m³"
+    )
+
+
+def cmd_drainage(args: argparse.Namespace) -> None:
+    rep = simulate_water_ponding(args.target, args.out, up_axis=args.up_axis, cell_m=args.cell_m, min_depth_mm=args.min_depth_mm)
+    print(f"[lidup] Simulação hidrológica salva em: {args.out}")
+    print(
+        f"[lidup] Área empoçada: {rep.ponding_area_m2:.2f} m² ({rep.ponding_pct:.1f}% do piso) | "
+        f"Lâmina máx: {rep.max_depth_mm:.1f} mm | Volume retido: {rep.water_volume_liters:.1f} L"
+    )
+
+
+def cmd_clearance(args: argparse.Namespace) -> None:
+    sensor_xy = (args.sensor_x, args.sensor_y) if (args.sensor_x is not None and args.sensor_y is not None) else None
+    rep = analyze_clearance_and_viewshed(
+        args.target,
+        args.out,
+        box_width_m=args.width,
+        box_depth_m=args.depth,
+        box_height_m=args.height,
+        sensor_xy_m=sensor_xy,
+        up_axis=args.up_axis,
+        cell_m=args.cell_m,
+    )
+    print(f"[lidup] Análise logística e CFTV salva em: {args.out}")
+    print(
+        f"[lidup] Caixa {rep.box_dimensions_m[0]:.2f}×{rep.box_dimensions_m[1]:.2f}×{rep.box_dimensions_m[2]:.2f}m: "
+        f"Passa livre em {rep.passable_area_m2:.2f} m² ({rep.passable_pct:.1f}%) | "
+        f"Visibilidade sensor: {rep.viewshed_pct:.1f}% (Ponto cego: {rep.blindspot_area_m2:.2f} m²)"
+    )
+
+
+def cmd_volume(args: argparse.Namespace) -> None:
+    rep = compute_object_or_pile_volume(
+        args.target,
+        args.out,
+        up_axis=args.up_axis,
+        cell_m=args.cell_m,
+        min_height_m=args.min_height_m,
+    )
+    print(f"[lidup] Cubagem de volume salva em: {args.out}")
+    print(
+        f"[lidup] Volume: {rep.volume_m3:.3f} m³ | Área base: {rep.footprint_m2:.2f} m² | "
+        f"Altura máx: {rep.max_height_m:.2f} m (Média: {rep.mean_height_m:.2f} m)"
+    )
+
+
+def cmd_reflective(args: argparse.Namespace) -> None:
+    rep = detect_reflective_surfaces(args.bundle, args.out, max_depth_m=args.max_depth)
+    print(f"[lidup] Detecção de vidros/espelhos salva em: {args.out}")
+    print(
+        f"[lidup] Frames analisados: {rep.frames_analyzed} | Pontos suspeitos (conf=0): {rep.reflective_point_count} "
+        f"({rep.reflective_ratio_pct:.1f}%)"
     )
 
 
@@ -545,68 +651,43 @@ def cmd_view(args: argparse.Namespace) -> None:
         use_mvs=args.mvs,
         photometric_opt=args.photometric_opt,
     )
+    t_low = str(args.target).lower()
+    up_hint = "z" if any(k in t_low for k in ("georef", "enu", "pond", "drain", "diff", "clearance", "viewshed", "mdt")) else "y"
     if args.measure:
-        pick_geom = geom
-        if isinstance(geom, o3d.geometry.TriangleMesh):
-            pick_geom = o3d.geometry.PointCloud(geom.vertices)
-            if geom.has_vertex_colors():
-                pick_geom.colors = geom.vertex_colors
-            else:
-                pick_geom.paint_uniform_color([0.75, 0.78, 0.82])
         print(
-            "[lidup] Modo Régua 3D ativo: segure SHIFT + clique esquerdo para marcar pontos (Shift+Dir desfaz) e pressione Q para calcular as distâncias."
+            "[lidup] Modo Régua 3D ativo: clique curto com botão esquerdo sobre o modelo/nuvem marca pontos P1 -> P2. "
+            "Arrastar = gira/olha | WASD + E/X = anda | Setas = olha ao redor | Z = desfaz | Q = conclui."
         )
-        vis = o3d.visualization.VisualizerWithEditing()
-        vis.create_window(window_name=f"{title} [Régua 3D: Shift+Clique | Q fecha]", width=1280, height=800)
-        vis.add_geometry(pick_geom)
-        if args.show_axes:
-            vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5))
-        opt = vis.get_render_option()
-        opt.background_color = np.asarray([0.08, 0.09, 0.11])
-        opt.point_size = float(args.point_size)
-        vis.run()
-        picked = list(vis.get_picked_points())
-        vis.destroy_window()
+    else:
+        print(f"[lidup] Abrindo visualizador 3D: {title}")
+        print(
+            "[lidup] Controles: Arrastar = girar/olhar | WASD = frente/trás/lados | E/X = subir/descer | "
+            "Setas = olhar ao redor | 1-4/R = vistas rápidas | C = cores | Q = fechar"
+        )
 
-        up_hint = "z" if "georef" in str(args.target).lower() else "y"
-        pts_arr = np.asarray(pick_geom.points)
-        segs = compute_picked_measurements(pts_arr, picked, up_axis=up_hint)
-        if not picked:
-            print("[lidup] Nenhum ponto selecionado.")
-        elif len(picked) == 1:
-            p0 = pts_arr[picked[0]]
-            print(f"[lidup] 1 ponto selecionado (#{picked[0]}): ({p0[0]:.3f}, {p0[1]:.3f}, {p0[2]:.3f}) m — marque ao menos 2 pontos.")
-        else:
-            total_m = sum(float(s["dist_3d_m"]) for s in segs)
-            for i, s in enumerate(segs, start=1):
-                print(
-                    f"[lidup] Trecho {i} (#{s['from_index']} -> #{s['to_index']}): "
-                    f"3D = {s['dist_3d_m']:.3f} m ({s['dist_3d_m'] * 100.0:.1f} cm) | "
-                    f"Horiz = {s['dist_horiz_m']:.3f} m | dV = {s['dv_up_m']:+.3f} m | Incl = {s['slope_pct']:.1f}% | "
-                    f"(dX={s['dx_m']:+.3f}, dY={s['dy_m']:+.3f}, dZ={s['dz_m']:+.3f})"
-                )
-            print(f"[lidup] Total acumulado ({len(segs)} trechos): {total_m:.3f} m")
-        return
-
-    print(f"[lidup] Abrindo visualizador 3D: {title}")
-    print(
-        "[lidup] Controles: Arrastar esquerdo = girar | Scroll ou W/↑ = aproximar | S/↓ = distanciar | "
-        "I/O ou PgUp/PgDn = entrar/recuar | A/D = mover lados | C = alternar Cor/Cinza/Altura | R = resetar | +/- = tamanho | Q = fechar"
+    segs = run_interactive_ruler(
+        geom,
+        title=title,
+        up_axis=up_hint,
+        point_size=float(args.point_size),
+        show_axes=bool(args.show_axes),
+        measure_default=bool(args.measure),
+        start_no_color=bool(args.no_color),
     )
-
-    vis = o3d.visualization.VisualizerWithKeyCallback()
-    vis.create_window(window_name=title, width=1280, height=800)
-    vis.add_geometry(geom)
-    if args.show_axes:
-        axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
-        vis.add_geometry(axes)
-
-    configure_view_controls(vis, geom, start_no_color=args.no_color)
-    opt = vis.get_render_option()
-    opt.background_color = np.asarray([0.08, 0.09, 0.11])
-    opt.point_size = float(args.point_size)
-    vis.run()
-    vis.destroy_window()
+    if segs:
+        total_m = sum(float(s["dist_3d_m"]) for s in segs)
+        for s in segs:
+            print(
+                f"[lidup] Trecho {s['segment_index']} (#{s['from_index']} -> #{s['to_index']}): "
+                f"3D = {s['dist_3d_m']:.3f} m ({s['dist_3d_m'] * 100.0:.1f} cm) | "
+                f"Horiz = {s['dist_horiz_m']:.3f} m | dV = {s['dv_up_m']:+.3f} m | Incl = {s['slope_pct']:.1f}% | "
+                f"(dX={s['dx_m']:+.3f}, dY={s['dy_m']:+.3f}, dZ={s['dz_m']:+.3f})"
+            )
+        print(f"[lidup] Total acumulado ({len(segs)} trechos): {total_m:.3f} m")
+    elif args.measure:
+        print("[lidup] Menos de 2 pontos selecionados na régua.")
+    print("[lidup] Visor 3D encerrado.")
+    sys.stdout.flush()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -696,6 +777,52 @@ def build_parser() -> argparse.ArgumentParser:
     p_room.add_argument("--out", required=True, help="Pasta de saída para floorplan.svg, floorplan.dxf, floor_flatness.ply e room_report.json.")
     p_room.add_argument("--up-axis", default="auto", choices=["auto", "y", "z"], help="Eixo vertical UP (auto, y para nuvem local ARKit, z para georef/ENU).")
     p_room.set_defaults(func=cmd_analyze_room)
+
+    p_studio = sub.add_parser("studio", help="Abre a central gráfica desktop LidUp Studio (sem precisar digitar comandos).")
+    p_studio.add_argument("--workspace", default=None, help="Pasta inicial com capturas e saídas.")
+    p_studio.set_defaults(func=lambda a: __import__("lidup.studio", fromlist=["launch_studio"]).launch_studio(a.workspace))
+
+    p_diff = sub.add_parser("diff", help="Inspeção 4D Antes×Depois: gera mapa de calor em mm e variação de volume m³.")
+    p_diff.add_argument("before", help="Modelo/nuvem de referência (Antes).")
+    p_diff.add_argument("after", help="Modelo/nuvem comparada (Depois).")
+    p_diff.add_argument("--out", required=True, help="Pasta de saída (diff_heatmap.ply + diff_report.json).")
+    p_diff.add_argument("--no-align", action="store_true", help="Não roda ICP antes da comparação.")
+    p_diff.add_argument("--tol-mm", type=float, default=15.0, help="Tolerância de mudança neutra em milímetros.")
+    p_diff.set_defaults(func=cmd_diff)
+
+    p_drain = sub.add_parser("drainage", help="Simulação hidrológica (Priority-Flood): identifica empoçamento de água e volumes (L).")
+    p_drain.add_argument("target", help="Nuvem/malha (.ply/.obj), pasta processada ou mdt.tif.")
+    p_drain.add_argument("--out", required=True, help="Pasta de saída (ponding_map.ply/.svg + drainage_report.json).")
+    p_drain.add_argument("--up-axis", default="auto", choices=["auto", "y", "z"])
+    p_drain.add_argument("--cell-m", type=float, default=0.04, help="Tamanho da célula da grade (m).")
+    p_drain.add_argument("--min-depth-mm", type=float, default=1.0, help="Lâmina mínima considerada poça (mm).")
+    p_drain.set_defaults(func=cmd_drainage)
+
+    p_clear = sub.add_parser("clearance", help="Simulador logístico ('Cabe/Passa?') e mapa de pontos cegos CFTV/luz.")
+    p_clear.add_argument("target", help="Nuvem/malha (.ply/.obj) ou pasta processada.")
+    p_clear.add_argument("--out", required=True, help="Pasta de saída (clearance_map.ply/.svg + viewshed_map.ply + clearance_report.json).")
+    p_clear.add_argument("--width", type=float, default=0.80, help="Largura da caixa/equipamento (m).")
+    p_clear.add_argument("--depth", type=float, default=1.20, help="Comprimento da caixa/equipamento (m).")
+    p_clear.add_argument("--height", type=float, default=1.80, help="Altura da caixa/equipamento (m).")
+    p_clear.add_argument("--sensor-x", type=float, default=None, help="Posição U opcional da câmera/luminária (m).")
+    p_clear.add_argument("--sensor-y", type=float, default=None, help="Posição V opcional da câmera/luminária (m).")
+    p_clear.add_argument("--up-axis", default="auto", choices=["auto", "y", "z"])
+    p_clear.add_argument("--cell-m", type=float, default=0.05)
+    p_clear.set_defaults(func=cmd_clearance)
+
+    p_vol = sub.add_parser("volume", help="Cubagem de pilhas ou objetos (calcula volume m³ acima da base).")
+    p_vol.add_argument("target", help="Nuvem/malha (.ply/.obj) ou pasta processada.")
+    p_vol.add_argument("--out", required=True, help="Pasta de saída (volume_heatmap.ply + volume_report.json).")
+    p_vol.add_argument("--up-axis", default="auto", choices=["auto", "y", "z"])
+    p_vol.add_argument("--cell-m", type=float, default=0.04)
+    p_vol.add_argument("--min-height-m", type=float, default=0.04)
+    p_vol.set_defaults(func=cmd_volume)
+
+    p_ref = sub.add_parser("reflective", help="Detecta vidros, espelhos ou água usando confidence==0 no pacote bruto.")
+    p_ref.add_argument("bundle", help="Pasta do pacote bruto lidup_bundle_v1.")
+    p_ref.add_argument("--out", required=True, help="Pasta de saída (reflective_zones.ply + reflective_report.json).")
+    p_ref.add_argument("--max-depth", type=float, default=4.5)
+    p_ref.set_defaults(func=cmd_reflective)
 
     return parser
 

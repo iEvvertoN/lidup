@@ -49,7 +49,7 @@ def _load_rust_lib() -> ctypes.CDLL | None:
             lib = ctypes.CDLL(str(cand))
             lib.lidup_core_abi_version.argtypes = []
             lib.lidup_core_abi_version.restype = ctypes.c_uint32
-            if int(lib.lidup_core_abi_version()) != 2:
+            if int(lib.lidup_core_abi_version()) != 3:
                 continue
 
             lib.lidup_depth_float32_to_mm_u16.argtypes = [
@@ -110,6 +110,18 @@ def _load_rust_lib() -> ctypes.CDLL | None:
                 ctypes.c_int32, ctypes.c_int32, ctypes.c_double, c_f64_p,
             ]
             lib.lidup_csf_cloth_filter_f64.restype = ctypes.c_int32
+
+            lib.lidup_priority_flood_ponding_f64.argtypes = [
+                c_f64_p, c_u8_p, ctypes.c_int32, ctypes.c_int32, c_f64_p
+            ]
+            lib.lidup_priority_flood_ponding_f64.restype = ctypes.c_int32
+
+            lib.lidup_clearance_and_viewshed_u8.argtypes = [
+                c_u8_p, c_u8_p, ctypes.c_int32, ctypes.c_int32,
+                ctypes.c_double, ctypes.c_double, ctypes.c_double,
+                ctypes.c_int32, ctypes.c_int32, c_u8_p, c_u8_p,
+            ]
+            lib.lidup_clearance_and_viewshed_u8.restype = ctypes.c_int32
 
             _LIB = lib
             return _LIB
@@ -463,3 +475,60 @@ def rust_csf_cloth_filter(
         )
     )
     return out if rc == 0 else None
+
+
+def rust_priority_flood_ponding(z_grid: np.ndarray, valid_mask: np.ndarray) -> np.ndarray | None:
+    lib = _load_rust_lib()
+    if lib is None:
+        return None
+    ny, nx = z_grid.shape[:2]
+    z_c = np.ascontiguousarray(z_grid, dtype=np.float64)
+    v_c = np.ascontiguousarray(valid_mask.astype(np.uint8))
+    out = np.empty((ny, nx), dtype=np.float64)
+    rc = int(
+        lib.lidup_priority_flood_ponding_f64(
+            z_c.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            v_c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.c_int32(nx),
+            ctypes.c_int32(ny),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        )
+    )
+    return out if rc == 0 else None
+
+
+def rust_clearance_and_viewshed(
+    occ_mask: np.ndarray,
+    domain_mask: np.ndarray,
+    cell_m: float,
+    half_w_m: float,
+    half_d_m: float,
+    sensor_ix: int,
+    sensor_iy: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    lib = _load_rust_lib()
+    if lib is None:
+        return None
+    ny, nx = occ_mask.shape[:2]
+    o_c = np.ascontiguousarray(occ_mask.astype(np.uint8))
+    d_c = np.ascontiguousarray(domain_mask.astype(np.uint8))
+    out_p = np.empty((ny, nx), dtype=np.uint8)
+    out_v = np.empty((ny, nx), dtype=np.uint8)
+    rc = int(
+        lib.lidup_clearance_and_viewshed_u8(
+            o_c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            d_c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.c_int32(nx),
+            ctypes.c_int32(ny),
+            ctypes.c_double(cell_m),
+            ctypes.c_double(half_w_m),
+            ctypes.c_double(half_d_m),
+            ctypes.c_int32(sensor_ix),
+            ctypes.c_int32(sensor_iy),
+            out_p.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            out_v.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        )
+    )
+    if rc != 0:
+        return None
+    return out_p.astype(bool), out_v.astype(bool)

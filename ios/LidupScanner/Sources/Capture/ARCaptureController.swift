@@ -51,8 +51,12 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
     @Published var showLidarMeshOverlay: Bool = true
     @Published var imuStabilizedCapture: Bool = true
     @Published var highDensityDepthEnabled: Bool = true
+    @Published var lidarOnlyMode: Bool = false
+    @Published var saveAnchorMesh: Bool = true
 
     @Published private(set) var isRecording: Bool = false
+    @Published private(set) var recordingStartDate: Date?
+    @Published private(set) var activeStorageLabel: String = "Memória iPhone"
     @Published private(set) var savedFrameCount: Int = 0
     @Published private(set) var savedDepthOnlyCount: Int = 0
     @Published private(set) var rejectedBlurCount: Int = 0
@@ -76,6 +80,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
     let arSession = ARSession()
     let locationProvider: CoreLocationProvider
     let motionProvider = MotionProvider()
+    let externalStorage = ExternalStorageManager()
 
     private var writer: BundleWriter?
     private var lastKeyframeTransform: simd_float4x4?
@@ -192,15 +197,49 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
             imageHeight: 0,
             depthWidth: 0,
             depthHeight: 0,
-            depthUnit: "millimeters_uint16"
+            depthUnit: "millimeters_uint16",
+            lidarOnly: lidarOnlyMode
         )
 
         do {
-            writer = try BundleWriter(
-                sectorName: sectorName,
-                config: cfg,
-                hasLidar: hasLidarSupport
-            )
+            let extAccess = externalStorage.acquireWritableRootURL()
+            let wantsExternal = externalStorage.hasConfiguredExternalFolder
+            var chosenWriter: BundleWriter? = nil
+            var usedExternal = false
+
+            if let extAccess {
+                do {
+                    chosenWriter = try BundleWriter(
+                        sectorName: sectorName,
+                        config: cfg,
+                        hasLidar: hasLidarSupport,
+                        customRootDirectory: extAccess.url,
+                        securityScopedRoot: extAccess.scoped
+                    )
+                    usedExternal = true
+                } catch {
+                    if extAccess.scoped {
+                        extAccess.url.stopAccessingSecurityScopedResource()
+                    }
+                }
+            }
+
+            if chosenWriter == nil {
+                chosenWriter = try BundleWriter(
+                    sectorName: sectorName,
+                    config: cfg,
+                    hasLidar: hasLidarSupport
+                )
+            }
+
+            writer = chosenWriter
+            if usedExternal {
+                activeStorageLabel = "USB: \(externalStorage.folderName ?? "Pendrive")"
+            } else if wantsExternal {
+                activeStorageLabel = "iPhone (USB ausente)"
+            } else {
+                activeStorageLabel = "Memória iPhone"
+            }
             savedFrameCount = 0
             savedDepthOnlyCount = 0
             rejectedBlurCount = 0
@@ -216,9 +255,10 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
             scaleBars = []
             stillDepthRing = []
             focusLockTask?.cancel()
+            recordingStartDate = Date()
             isRecording = true
             motionProvider.setIMUWriter(writer)
-            if lockCameraOptics {
+            if lockCameraOptics && !lidarOnlyMode {
                 applyOpticsLockIfNeeded(lock: false)
                 focusLockTask = Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 350_000_000)
@@ -228,7 +268,12 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
             } else {
                 applyOpticsLockIfNeeded(lock: false)
             }
-            lastStatusMessage = "Gravação iniciada em \(writer?.sessionId ?? "")"
+            let modeTag = lidarOnlyMode ? " [Só LiDAR]" : ""
+            if wantsExternal && !usedExternal {
+                lastStatusMessage = "⚠️ Pendrive OTG desconectado — gravando no iPhone\(modeTag): \(writer?.sessionId ?? "")"
+            } else {
+                lastStatusMessage = "Gravando (\(activeStorageLabel))\(modeTag): \(writer?.sessionId ?? "")"
+            }
         } catch {
             lastStatusMessage = "Erro ao iniciar pacote: \(error.localizedDescription)"
         }
@@ -236,6 +281,7 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
 
     func stopRecording() {
         isRecording = false
+        recordingStartDate = nil
         focusLockTask?.cancel()
         focusLockTask = nil
         stillDepthRing.removeAll(keepingCapacity: false)
@@ -246,11 +292,14 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
 
         guard let currentWriter = writer else { return }
         writer = nil
-        let meshAnchors = arSession.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
-        currentWriter.saveARMeshAnchors(meshAnchors)
+        if saveAnchorMesh {
+            let meshAnchors = arSession.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+            currentWriter.saveARMeshAnchors(meshAnchors)
+        }
+        let targetTag = activeStorageLabel
         currentWriter.finish { [weak self] in
             Task { @MainActor [weak self] in
-                self?.lastStatusMessage = "Pacote salvo: \(currentWriter.sessionId)"
+                self?.lastStatusMessage = "Pacote salvo (\(targetTag)): \(currentWriter.sessionId)"
             }
         }
     }
@@ -374,6 +423,44 @@ final class ARCaptureController: NSObject, ObservableObject, @preconcurrency ARS
             }
         }
         lastTrackedPosition = currentPos
+
+        if lidarOnlyMode {
+            let lidarDue: Bool = {
+                guard let lastDepthT = lastDepthBurstTransform else { return true }
+                guard (frame.timestamp - lastDepthBurstTimestamp) >= 0.08 else { return false }
+                return hasMovedEnough(
+                    from: lastDepthT,
+                    to: currentTransform,
+                    minDist: max(0.04, minTranslationM * 0.45),
+                    minAngleDeg: max(2.0, minRotationDeg * 0.45)
+                ) || (frame.timestamp - lastDepthBurstTimestamp) >= 0.30
+            }()
+
+            if lidarDue,
+               let depthSource = frame.sceneDepth ?? frame.smoothedSceneDepth,
+               let rawBurstDepth = RawDepthSnapshot.captureRaw(from: depthSource.depthMap, confidenceMap: depthSource.confidenceMap) {
+                let idx = frameCounter
+                frameCounter += 1
+                savedDepthOnlyCount += 1
+                lastDepthBurstTransform = currentTransform
+                lastDepthBurstTimestamp = frame.timestamp
+
+                activeWriter.appendKeyframe(
+                    frameIndex: idx,
+                    timestampS: frame.timestamp,
+                    pixelBuffer: nil,
+                    imageSizeHint: frame.camera.imageResolution,
+                    transform: currentTransform,
+                    depthTransform: currentTransform,
+                    intrinsics: frame.camera.intrinsics,
+                    sharpness: 0,
+                    trackingStateLabel: "normal",
+                    rawDepth: rawBurstDepth,
+                    gnss: locationProvider.latestSample
+                )
+            }
+            return
+        }
 
         // Enquanto o still de 12 MP está em voo (~60–180ms), guarda até 5 snapshots brutos de LiDAR para emparelhar <8ms.
         if isCapturingStill,

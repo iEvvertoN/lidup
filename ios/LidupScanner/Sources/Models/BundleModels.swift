@@ -44,6 +44,7 @@ struct CaptureConfig: Codable {
     var depthWidth: Int
     var depthHeight: Int
     var depthUnit: String
+    var lidarOnly: Bool?
 
     enum CodingKeys: String, CodingKey {
         case minTranslationM = "min_translation_m"
@@ -55,6 +56,7 @@ struct CaptureConfig: Codable {
         case depthWidth = "depth_width"
         case depthHeight = "depth_height"
         case depthUnit = "depth_unit"
+        case lidarOnly = "lidar_only"
     }
 }
 
@@ -149,6 +151,8 @@ struct CapturedBundleSummary: Identifiable, Hashable {
     let sectorName: String
     let createdAt: Date
     let frameCount: Int
+    let depthCount: Int
     let gcpCount: Int
     let sizeBytes: Int64
+    let isExternal: Bool
 }

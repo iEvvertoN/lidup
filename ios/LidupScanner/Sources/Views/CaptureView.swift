@@ -1,12 +1,18 @@
 import SwiftUI
+import UIKit
 
 struct CaptureView: View {
     @ObservedObject var controller: ARCaptureController
     @ObservedObject var locationProvider: CoreLocationProvider
+    @ObservedObject var externalStorage: ExternalStorageManager
 
     @State private var showGCPDialog = false
     @State private var showScaleDialog = false
     @State private var showSettings = false
+    @State private var showFolderPicker = false
+    @State private var showSettingsFolderPicker = false
+    @State private var showRenameAlert = false
+    @State private var draftSectorName = ""
 
     @State private var stakeName = "ESTACA-01"
     @State private var stakeNotes = ""
@@ -14,6 +20,10 @@ struct CaptureView: View {
     @State private var pointAId = "ESTACA-01"
     @State private var pointBId = "ESTACA-02"
     @State private var scaleDistanceText = "10.0"
+
+    private let lidarRed = Color(red: 1.0, green: 0.24, blue: 0.20)
+    private let cardBg = Color.black.opacity(0.72)
+    private let borderColor = Color.white.opacity(0.14)
 
     var body: some View {
         ZStack {
@@ -23,22 +33,34 @@ struct CaptureView: View {
             )
             .ignoresSafeArea()
 
-            VStack(spacing: 12) {
+            centerReticle
+                .allowsHitTesting(false)
+
+            VStack(spacing: 10) {
                 topStatusBar
                 Spacer()
                 if controller.isCollectingGCP {
                     gcpProgressBanner
                 }
                 if let msg = controller.lastStatusMessage {
-                    Text(msg)
-                        .font(.caption.weight(.medium))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(controller.isRecording ? lidarRed : .white.opacity(0.7))
+                            .frame(width: 6, height: 6)
+                        Text(msg)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.white)
+                            .lineLimit(2)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(cardBg, in: Capsule())
+                    .overlay(Capsule().stroke(borderColor, lineWidth: 1))
                 }
                 bottomControls
             }
-            .padding()
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
         }
         .onAppear {
             controller.startARSession()
@@ -57,87 +79,204 @@ struct CaptureView: View {
         .sheet(isPresented: $showScaleDialog) {
             scaleSheet
         }
+        .sheet(isPresented: $showFolderPicker) {
+            ExternalFolderPicker { result in
+                showFolderPicker = false
+                handlePickedFolder(result)
+            }
+        }
+        .alert("Nome do Bloco / Setor", isPresented: $showRenameAlert) {
+            TextField("ex: boi_nelore_01", text: $draftSectorName)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Cancelar", role: .cancel) {}
+            Button("Salvar") {
+                let cleaned = draftSectorName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleaned.isEmpty {
+                    controller.sectorName = cleaned
+                }
+            }
+        } message: {
+            Text("Defina o nome da pasta que será criada para esta captura.")
+        }
     }
+
+    // MARK: - Mira Central + Profundidade ao Vivo
+
+    private var centerReticle: some View {
+        let movingFast = controller.isRecording && controller.angularSpeedDegS > 35.0
+        let ringColor: Color = movingFast ? .orange : .white.opacity(0.75)
+
+        return VStack(spacing: 6) {
+            ZStack {
+                Circle()
+                    .stroke(ringColor, lineWidth: 1.2)
+                    .frame(width: 26, height: 26)
+                Circle()
+                    .fill(controller.showLidarMeshOverlay ? lidarRed : .white)
+                    .frame(width: 4, height: 4)
+            }
+            if let depthM = controller.centerDepthM {
+                Text(String(format: "%.2f m", depthM))
+                    .font(.caption2.monospacedDigit().bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.black.opacity(0.65), in: Capsule())
+                    .overlay(Capsule().stroke(borderColor, lineWidth: 0.8))
+            }
+        }
+    }
+
+    // MARK: - Barra Superior
 
     private var topStatusBar: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label(controller.trackingLabel, systemImage: controller.trackingReady ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .font(.caption.bold())
-                    .foregroundStyle(controller.trackingReady ? .green : .yellow)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(.black.opacity(0.65), in: Capsule())
+            HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(controller.trackingReady ? Color.green : Color.yellow)
+                        .frame(width: 7, height: 7)
+                    Text(controller.trackingLabel)
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(cardBg, in: Capsule())
+                .overlay(Capsule().stroke(borderColor, lineWidth: 1))
+
+                if controller.isRecording, let startDate = controller.recordingStartDate {
+                    TimelineView(.periodic(from: startDate, by: 1.0)) { context in
+                        let secs = max(0, Int(context.date.timeIntervalSince(startDate)))
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(lidarRed)
+                                .frame(width: 7, height: 7)
+                            Text(String(format: "%02d:%02d", secs / 60, secs % 60))
+                                .font(.caption.monospacedDigit().bold())
+                                .foregroundStyle(.white)
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(lidarRed.opacity(0.24), in: Capsule())
+                        .overlay(Capsule().stroke(lidarRed.opacity(0.75), lineWidth: 1))
+                    }
+                }
 
                 Spacer()
 
                 if let gnss = locationProvider.latestSample {
-                    Label(String(format: "GPS ±%.1fm", gnss.hAccM), systemImage: "location.fill")
-                        .font(.caption.bold())
+                    Label(String(format: "±%.1fm", gnss.hAccM), systemImage: "location.fill")
+                        .font(.caption2.monospacedDigit().bold())
                         .foregroundStyle(gnss.hAccM <= 5 ? .green : .orange)
-                        .padding(.horizontal, 10)
+                        .padding(.horizontal, 9)
                         .padding(.vertical, 6)
-                        .background(.black.opacity(0.65), in: Capsule())
+                        .background(cardBg, in: Capsule())
+                        .overlay(Capsule().stroke(borderColor, lineWidth: 1))
                 } else {
-                    Label("Sem GPS", systemImage: "location.slash")
-                        .font(.caption.bold())
-                        .foregroundStyle(.red)
-                        .padding(.horizontal, 10)
+                    Label("GPS --", systemImage: "location.slash")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.white.opacity(0.65))
+                        .padding(.horizontal, 9)
                         .padding(.vertical, 6)
-                        .background(.black.opacity(0.65), in: Capsule())
+                        .background(cardBg, in: Capsule())
+                        .overlay(Capsule().stroke(borderColor, lineWidth: 1))
                 }
 
                 if controller.hasMeshReconstructionSupport {
                     Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         controller.showLidarMeshOverlay.toggle()
                     } label: {
-                        Image(systemName: controller.showLidarMeshOverlay ? "cube.transparent.fill" : "cube.transparent")
-                            .font(.body.bold())
-                            .foregroundStyle(controller.showLidarMeshOverlay ? .cyan : .white.opacity(0.75))
-                            .padding(8)
-                            .background(.black.opacity(0.65), in: Circle())
+                        Image(systemName: controller.showLidarMeshOverlay ? "circle.grid.3x3.fill" : "circle.grid.3x3")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(controller.showLidarMeshOverlay ? lidarRed : .white.opacity(0.55))
+                            .frame(width: 34, height: 34)
+                            .background(cardBg, in: Circle())
+                            .overlay(
+                                Circle().stroke(
+                                    controller.showLidarMeshOverlay ? lidarRed.opacity(0.75) : borderColor,
+                                    lineWidth: 1
+                                )
+                            )
                     }
-                    .accessibilityLabel("Alternar malha LiDAR")
+                    .accessibilityLabel("Alternar pontos vermelhos LiDAR")
                 }
 
                 Button {
                     showSettings = true
                 } label: {
                     Image(systemName: "slider.horizontal.3")
-                        .font(.body.bold())
+                        .font(.subheadline.bold())
                         .foregroundStyle(.white)
-                        .padding(8)
-                        .background(.black.opacity(0.65), in: Circle())
+                        .frame(width: 34, height: 34)
+                        .background(cardBg, in: Circle())
+                        .overlay(Circle().stroke(borderColor, lineWidth: 1))
                 }
                 .disabled(controller.isRecording)
+                .opacity(controller.isRecording ? 0.4 : 1.0)
             }
 
-            HStack(spacing: 8) {
-                metricPill(title: "Fotos", value: "\(controller.savedFrameCount)")
-                metricPill(title: "Depth+", value: "\(controller.savedDepthOnlyCount)")
-                metricPill(title: "Dist", value: String(format: "%.1fm", controller.walkedDistanceM))
-                metricPill(
-                    title: "LiDAR",
-                    value: controller.centerDepthM.map { String(format: "%.2fm", $0) } ?? "-"
+            HStack(spacing: 0) {
+                telemetryCell(
+                    label: controller.lidarOnlyMode ? "LIDAR" : "FOTOS / DEPTH",
+                    value: controller.lidarOnlyMode
+                        ? "\(controller.savedDepthOnlyCount) pts"
+                        : "\(controller.savedFrameCount) / \(controller.savedDepthOnlyCount)"
                 )
-                metricPill(title: "Gyro", value: String(format: "%.0f°/s", controller.angularSpeedDegS))
+                dividerLine
+                telemetryCell(
+                    label: "PERCURSO",
+                    value: String(format: "%.1f m", controller.walkedDistanceM)
+                )
+                dividerLine
+                telemetryCell(
+                    label: "GIRO",
+                    value: String(format: "%.0f°/s", controller.angularSpeedDegS),
+                    highlight: controller.angularSpeedDegS > 35.0
+                )
+                dividerLine
+                telemetryCell(
+                    label: "DESTINO",
+                    value: controller.isRecording
+                        ? (externalStorage.hasConfiguredExternalFolder && controller.activeStorageLabel.hasPrefix("USB") ? "USB OTG" : "iPhone")
+                        : (externalStorage.hasConfiguredExternalFolder ? "USB OTG" : "iPhone"),
+                    accentGreen: externalStorage.hasConfiguredExternalFolder
+                )
             }
+            .padding(.vertical, 7)
+            .background(cardBg, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(borderColor, lineWidth: 1))
         }
     }
 
-    private func metricPill(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.75))
+    private var dividerLine: some View {
+        Rectangle()
+            .fill(borderColor)
+            .frame(width: 1, height: 24)
+    }
+
+    private func telemetryCell(
+        label: String,
+        value: String,
+        highlight: Bool = false,
+        accentGreen: Bool = false
+    ) -> some View {
+        VStack(spacing: 2) {
+            Text(label)
+                .font(.system(size: 9, weight: .bold))
+                .tracking(0.6)
+                .foregroundStyle(.white.opacity(0.55))
+                .lineLimit(1)
             Text(value)
                 .font(.caption.monospacedDigit().bold())
-                .foregroundStyle(.white)
+                .foregroundStyle(highlight ? .orange : (accentGreen ? .green : .white))
                 .lineLimit(1)
+                .minimumScaleFactor(0.8)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(.black.opacity(0.60), in: RoundedRectangle(cornerRadius: 10))
+        .frame(maxWidth: .infinity)
     }
 
     private var gcpProgressBanner: some View {
@@ -151,50 +290,162 @@ struct CaptureView: View {
                     controller.cancelStationaryGCP()
                 }
                 .font(.caption.bold())
-                .foregroundStyle(.red)
+                .foregroundStyle(lidarRed)
             }
             ProgressView(value: controller.gcpProgress)
                 .tint(.green)
         }
         .padding(12)
-        .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 12))
+        .background(cardBg, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(borderColor, lineWidth: 1))
     }
 
+    // MARK: - Painel Inferior
+
     private var bottomControls: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             if !controller.isRecording {
                 HStack(spacing: 8) {
+                    Button {
+                        draftSectorName = controller.sectorName
+                        showRenameAlert = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "tag.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.65))
+                            Text(controller.sectorName)
+                                .font(.caption.monospaced().bold())
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                            Image(systemName: "pencil")
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.55))
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(cardBg, in: Capsule())
+                        .overlay(Capsule().stroke(borderColor, lineWidth: 1))
+                    }
+
+                    Spacer()
+
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        controller.lidarOnlyMode.toggle()
+                        controller.lastStatusMessage = controller.lidarOnlyMode
+                            ? "Modo Só LiDAR ativo (~90–97% menor)"
+                            : "Modo Fotos 12 MP + LiDAR ativo"
+                    } label: {
+                        Label(
+                            controller.lidarOnlyMode ? "Só LiDAR" : "Fotos + LiDAR",
+                            systemImage: controller.lidarOnlyMode ? "dot.radiowaves.left.and.right" : "camera.fill"
+                        )
+                        .font(.caption.bold())
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            controller.lidarOnlyMode ? lidarRed.opacity(0.88) : cardBg,
+                            in: Capsule()
+                        )
+                        .overlay(
+                            Capsule().stroke(
+                                controller.lidarOnlyMode ? lidarRed : borderColor,
+                                lineWidth: 1
+                            )
+                        )
+                        .foregroundStyle(.white)
+                    }
+                }
+
+                HStack(spacing: 6) {
                     ForEach(CapturePreset.allCases) { preset in
                         let selected = controller.capturePreset == preset
                         Button {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
                             controller.applyPreset(preset)
                         } label: {
                             Text(preset.shortTitle)
                                 .font(.caption.bold())
                                 .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
+                                .padding(.vertical, 9)
                                 .background(
-                                    selected ? Color.cyan.opacity(0.85) : Color.black.opacity(0.65),
+                                    selected ? Color.white : Color.clear,
                                     in: RoundedRectangle(cornerRadius: 10)
                                 )
-                                .foregroundStyle(selected ? .black : .white)
+                                .foregroundStyle(selected ? .black : .white.opacity(0.78))
                         }
                     }
                 }
-            }
+                .padding(4)
+                .background(cardBg, in: RoundedRectangle(cornerRadius: 13))
+                .overlay(RoundedRectangle(cornerRadius: 13).stroke(borderColor, lineWidth: 1))
 
-            if controller.isRecording {
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
+                    Button {
+                        showFolderPicker = true
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "externaldrive.fill")
+                                    .font(.caption2)
+                                Text(externalStorage.hasConfiguredExternalFolder ? "USB OTG" : "MEMÓRIA")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .tracking(0.5)
+                            }
+                            .foregroundStyle(externalStorage.hasConfiguredExternalFolder ? .green : .white.opacity(0.6))
+                            Text(externalStorage.folderName ?? "iPhone Interno")
+                                .font(.caption.bold())
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(cardBg, in: RoundedRectangle(cornerRadius: 14))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14).stroke(
+                                externalStorage.hasConfiguredExternalFolder ? Color.green.opacity(0.55) : borderColor,
+                                lineWidth: 1
+                            )
+                        )
+                    }
+
+                    Button {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        controller.toggleRecording()
+                    } label: {
+                        HStack(spacing: 10) {
+                            ZStack {
+                                Circle()
+                                    .stroke(.white, lineWidth: 2)
+                                    .frame(width: 24, height: 24)
+                                Circle()
+                                    .fill(lidarRed)
+                                    .frame(width: 14, height: 14)
+                            }
+                            Text("Iniciar")
+                                .font(.headline.bold())
+                                .foregroundStyle(.black)
+                        }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 14)
+                        .background(.white, in: RoundedRectangle(cornerRadius: 16))
+                    }
+                }
+            } else {
+                HStack(spacing: 10) {
                     Button {
                         stakeName = String(format: "ESTACA-%02d", controller.gcpPoints.count + 1)
                         stakeNotes = ""
                         showGCPDialog = true
                     } label: {
-                        Label("Estaca (GCP)", systemImage: "mappin.and.ellipse")
-                            .font(.subheadline.bold())
+                        Label("Estaca", systemImage: "mappin.and.ellipse")
+                            .font(.caption.bold())
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                            .background(.blue.opacity(0.9), in: RoundedRectangle(cornerRadius: 12))
+                            .padding(.vertical, 13)
+                            .background(cardBg, in: RoundedRectangle(cornerRadius: 14))
+                            .overlay(RoundedRectangle(cornerRadius: 14).stroke(borderColor, lineWidth: 1))
                             .foregroundStyle(.white)
                     }
                     .disabled(controller.isCollectingGCP)
@@ -204,31 +455,36 @@ struct CaptureView: View {
                         showScaleDialog = true
                     } label: {
                         Label("Trena", systemImage: "ruler")
-                            .font(.subheadline.bold())
+                            .font(.caption.bold())
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                            .background(.orange.opacity(0.9), in: RoundedRectangle(cornerRadius: 12))
+                            .padding(.vertical, 13)
+                            .background(cardBg, in: RoundedRectangle(cornerRadius: 14))
+                            .overlay(RoundedRectangle(cornerRadius: 14).stroke(borderColor, lineWidth: 1))
                             .foregroundStyle(.white)
+                    }
+
+                    Button {
+                        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                        controller.toggleRecording()
+                    } label: {
+                        HStack(spacing: 8) {
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(.white)
+                                .frame(width: 14, height: 14)
+                            Text("Encerrar")
+                                .font(.subheadline.bold())
+                        }
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 13)
+                        .background(lidarRed, in: RoundedRectangle(cornerRadius: 14))
+                        .foregroundStyle(.white)
                     }
                 }
             }
-
-            Button {
-                controller.toggleRecording()
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: controller.isRecording ? "stop.circle.fill" : "record.circle")
-                        .font(.title2)
-                    Text(controller.isRecording ? "Encerrar Bloco" : "Iniciar Captura")
-                        .font(.headline)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 16)
-                .background(controller.isRecording ? .red : .green, in: RoundedRectangle(cornerRadius: 16))
-                .foregroundStyle(.white)
-            }
         }
     }
+
+    // MARK: - Sheets
 
     private var settingsSheet: some View {
         NavigationStack {
@@ -238,7 +494,7 @@ struct CaptureView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 }
-                Section("Modo de Captura") {
+                Section {
                     Picker("Preset", selection: Binding(
                         get: { controller.capturePreset },
                         set: { controller.applyPreset($0) }
@@ -248,9 +504,40 @@ struct CaptureView: View {
                         }
                     }
                     if controller.hasMeshReconstructionSupport {
-                        Toggle("Exibir malha LiDAR ao vivo", isOn: $controller.showLidarMeshOverlay)
+                        Toggle("Pontos vermelhos LiDAR ao vivo", isOn: $controller.showLidarMeshOverlay)
                     }
+                    Toggle("Modo Só LiDAR (sem fotos 12 MP)", isOn: $controller.lidarOnlyMode)
+                    Toggle("Salvar malha ARMesh (anchors_mesh.obj)", isOn: $controller.saveAnchorMesh)
+                } header: {
+                    Text("Modo de Captura")
+                } footer: {
+                    Text("O Modo Só LiDAR reduz o peso da pasta em ~90% a 97% e libera captura mais rápida de quadros para animais ou ambientes amplos.")
                 }
+
+                Section {
+                    HStack {
+                        Text("Pasta atual")
+                        Spacer()
+                        Text(externalStorage.folderName ?? "Memória do iPhone")
+                            .foregroundStyle(externalStorage.hasConfiguredExternalFolder ? .green : .secondary)
+                    }
+                    Button {
+                        showSettingsFolderPicker = true
+                    } label: {
+                        Label("Selecionar Pendrive OTG / Pasta...", systemImage: "externaldrive.fill")
+                    }
+                    if externalStorage.hasConfiguredExternalFolder {
+                        Button("Voltar para Memória do iPhone", role: .destructive) {
+                            externalStorage.clearExternalFolder()
+                            controller.lastStatusMessage = "Gravação definida para Memória do iPhone"
+                        }
+                    }
+                } header: {
+                    Text("Destino de Gravação (Pendrive OTG / Arquivos)")
+                } footer: {
+                    Text("Escolha uma pasta dentro do seu pendrive USB-C no app Arquivos. Se o pendrive for removido antes de iniciar, o app grava automaticamente no iPhone.")
+                }
+
                 Section("Gatilho Espacial (ARKit)") {
                     HStack {
                         Text("Distância mínima")
@@ -293,6 +580,26 @@ struct CaptureView: View {
                     Button("OK") { showSettings = false }
                 }
             }
+            .sheet(isPresented: $showSettingsFolderPicker) {
+                ExternalFolderPicker { result in
+                    showSettingsFolderPicker = false
+                    handlePickedFolder(result)
+                }
+            }
+        }
+    }
+
+    private func handlePickedFolder(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            do {
+                try externalStorage.saveExternalFolder(url: url)
+                controller.lastStatusMessage = "Destino OTG selecionado: \(url.lastPathComponent)"
+            } catch {
+                controller.lastStatusMessage = "Pasta sem permissão de escrita: \(error.localizedDescription)"
+            }
+        case .failure(let err):
+            controller.lastStatusMessage = "Erro ao selecionar pasta: \(err.localizedDescription)"
         }
     }
 

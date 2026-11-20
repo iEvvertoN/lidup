@@ -3,7 +3,8 @@ import ARKit
 import SceneKit
 import Metal
 
-/// Exibe o feed ao vivo da `ARSession` usando `ARSCNView` e renderiza a malha LiDAR em tempo real sem interferir no `arSession.delegate`.
+/// Exibe o feed ao vivo da `ARSession` usando `ARSCNView` e renderiza os pontos LiDAR em vermelho
+/// em tempo real sem interferir no `arSession.delegate`.
 struct ARPreviewContainer: UIViewRepresentable {
     let session: ARSession
     var showMeshOverlay: Bool
@@ -37,10 +38,10 @@ struct ARPreviewContainer: UIViewRepresentable {
     final class Coordinator: NSObject, ARSCNViewDelegate {
         var showMeshOverlay: Bool
 
-        private lazy var meshMaterial: SCNMaterial = {
+        private lazy var lidarPointMaterial: SCNMaterial = {
             let mat = SCNMaterial()
-            mat.fillMode = .lines
-            mat.diffuse.contents = UIColor.systemCyan.withAlphaComponent(0.65)
+            mat.diffuse.contents = UIColor(red: 1.0, green: 0.20, blue: 0.18, alpha: 0.92)
+            mat.emission.contents = UIColor(red: 0.95, green: 0.12, blue: 0.12, alpha: 0.45)
             mat.lightingModel = .constant
             mat.isDoubleSided = true
             return mat
@@ -54,57 +55,50 @@ struct ARPreviewContainer: UIViewRepresentable {
         func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
             guard let meshAnchor = anchor as? ARMeshAnchor else { return nil }
             let node = SCNNode()
-            node.geometry = SCNGeometry.fromMeshAnchor(meshAnchor, material: meshMaterial)
+            node.geometry = SCNGeometry.lidarPointsFromMeshAnchor(meshAnchor, material: lidarPointMaterial)
             node.isHidden = !showMeshOverlay
             return node
         }
 
         func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
             guard let meshAnchor = anchor as? ARMeshAnchor else { return }
-            node.geometry = SCNGeometry.fromMeshAnchor(meshAnchor, material: meshMaterial)
+            node.geometry = SCNGeometry.lidarPointsFromMeshAnchor(meshAnchor, material: lidarPointMaterial)
             node.isHidden = !showMeshOverlay
         }
     }
 }
 
 private extension SCNGeometry {
-    static func fromMeshAnchor(_ meshAnchor: ARMeshAnchor, material: SCNMaterial) -> SCNGeometry? {
+    static func lidarPointsFromMeshAnchor(_ meshAnchor: ARMeshAnchor, material: SCNMaterial) -> SCNGeometry? {
         let geometry = meshAnchor.geometry
         let vertices = geometry.vertices
-        let faces = geometry.faces
-        guard vertices.count > 0, faces.count > 0, faces.buffer.length > 0 else {
+        guard vertices.count > 0, vertices.buffer.length > 0 else {
             return nil
         }
 
+        // Copia o buffer de vértices para evitar corrida caso o ARKit recicle o buffer Metal.
+        let vertexData = Data(bytes: vertices.buffer.contents(), count: vertices.buffer.length)
         let vertexSource = SCNGeometrySource(
-            buffer: vertices.buffer,
-            vertexFormat: vertices.format,
+            data: vertexData,
             semantic: .vertex,
-            vertexCount: vertices.count,
+            vectorCount: vertices.count,
+            usesFloatComponents: true,
+            componentsPerVector: 3,
+            bytesPerComponent: MemoryLayout<Float>.size,
             dataOffset: vertices.offset,
             dataStride: vertices.stride
         )
 
-        let normals = geometry.normals
-        let normalSource = SCNGeometrySource(
-            buffer: normals.buffer,
-            vertexFormat: normals.format,
-            semantic: .normal,
-            vertexCount: normals.count,
-            dataOffset: normals.offset,
-            dataStride: normals.stride
-        )
+        var indices = [UInt32](repeating: 0, count: vertices.count)
+        for i in 0..<vertices.count {
+            indices[i] = UInt32(i)
+        }
+        let element = SCNGeometryElement(indices: indices, primitiveType: .point)
+        element.pointSize = 4.5
+        element.minimumPointScreenSpaceRadius = 2.2
+        element.maximumPointScreenSpaceRadius = 5.5
 
-        // Copia os índices para evitar leitura concorrente caso o ARKit recicle o buffer Metal.
-        let faceData = Data(bytes: faces.buffer.contents(), count: faces.buffer.length)
-        let element = SCNGeometryElement(
-            data: faceData,
-            primitiveType: .triangles,
-            primitiveCount: faces.count,
-            bytesPerIndex: faces.bytesPerIndex
-        )
-
-        let scnGeometry = SCNGeometry(sources: [vertexSource, normalSource], elements: [element])
+        let scnGeometry = SCNGeometry(sources: [vertexSource], elements: [element])
         scnGeometry.materials = [material]
         return scnGeometry
     }

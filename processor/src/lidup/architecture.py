@@ -19,6 +19,8 @@ class WallSegment:
     y2: float
     length_m: float
     inlier_count: int
+    tilt_deg: float = 0.0
+    plumb_mm_per_m: float = 0.0
 
 
 @dataclass
@@ -38,6 +40,8 @@ class RoomReport:
     floor_flatness_rms_mm: float
     floor_flatness_p95_mm: float
     floor_flatness_max_mm: float
+    max_wall_plumb_mm_per_m: float
+    mean_wall_plumb_mm_per_m: float
     floor_normal: list[float]
     floor_offset_d: float
     slice_band_m: list[float]
@@ -68,6 +72,10 @@ def _extract_points_from_input(target: str | Path | np.ndarray | o3d.geometry.Ge
             path / "cloud_georef.ply",
             path / "cloud_georef.laz",
             path / "cloud_georef.las",
+            path / "volume_heatmap.ply",
+            path / "ponding_map.ply",
+            path / "diff_heatmap.ply",
+            path / "floor_flatness.ply",
         ]
         chosen = next((c for c in candidates if c.exists()), None)
         if chosen is None:
@@ -309,7 +317,7 @@ def _extract_walls_and_align_2d(
 
     work = pcd_slice
     total_slice = max(1, len(work.points))
-    raw_walls: list[tuple[np.ndarray, np.ndarray, int]] = []
+    raw_walls: list[tuple[np.ndarray, np.ndarray, int, float, float]] = []
 
     for _ in range(12):
         if len(work.points) < 50:
@@ -317,11 +325,13 @@ def _extract_walls_and_align_2d(
         model, inliers = work.segment_plane(distance_threshold=0.035, ransac_n=3, num_iterations=600)
         n = np.asarray(model[:3], dtype=np.float64)
         n /= max(1e-9, float(np.linalg.norm(n)))
-        nz = abs(float(n[2]))
+        nz = min(1.0, abs(float(n[2])))
         inl_pts = np.asarray(work.points)[inliers]
         work = work.select_by_index(inliers, invert=True)
         if nz > 0.25 or len(inliers) < max(45, int(0.025 * total_slice)):
             continue
+        tilt_deg = math.degrees(math.asin(nz))
+        plumb_mm_m = (nz / max(1e-6, math.sqrt(max(0.0, 1.0 - nz * nz)))) * 1000.0
         # Projeta para 2D e recorta pelos percentis [2, 98]
         dir_2d = np.array([-n[1], n[0]], dtype=np.float64)
         dir_2d /= max(1e-9, float(np.linalg.norm(dir_2d)))
@@ -333,12 +343,12 @@ def _extract_walls_and_align_2d(
         if length >= 0.35:
             p1 = origin + s_lo * dir_2d
             p2 = origin + s_hi * dir_2d
-            raw_walls.append((p1, p2, len(inliers)))
+            raw_walls.append((p1, p2, len(inliers), tilt_deg, plumb_mm_m))
 
     # Alinha eixos 2D pela orientação da parede mais longa
     rot_angle = 0.0
     if raw_walls:
-        best_p1, best_p2, _ = max(raw_walls, key=lambda item: float(np.linalg.norm(item[1] - item[0])))
+        best_p1, best_p2, _, _, _ = max(raw_walls, key=lambda item: float(np.linalg.norm(item[1] - item[0])))
         delta = best_p2 - best_p1
         rot_angle = -math.atan2(float(delta[1]), float(delta[0]))
 
@@ -350,7 +360,7 @@ def _extract_walls_and_align_2d(
     slice_2d = raw_slice_2d @ rot_2d.T
 
     walls: list[WallSegment] = []
-    for p1, p2, cnt in raw_walls:
+    for p1, p2, cnt, t_deg, p_mm in raw_walls:
         q1 = rot_2d @ p1
         q2 = rot_2d @ p2
         seg_len = float(np.linalg.norm(q2 - q1))
@@ -362,6 +372,8 @@ def _extract_walls_and_align_2d(
                 y2=round(float(q2[1]), 4),
                 length_m=round(seg_len, 4),
                 inlier_count=int(cnt),
+                tilt_deg=round(t_deg, 2),
+                plumb_mm_per_m=round(p_mm, 1),
             )
         )
 
@@ -444,14 +456,16 @@ def _export_floorplan_svg(
             px, py = to_px(float(p[0]), float(p[1]))
             lines.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="1.4" fill="#38bdf8" fill-opacity="0.55"/>')
 
-    # Segmentos de parede ajustados + cotas em metros
+    # Segmentos de parede ajustados + cotas em metros e prumo mm/m
     for w in walls:
         p1x, p1y = to_px(w.x1, w.y1)
         p2x, p2y = to_px(w.x2, w.y2)
         lines.append(f'<line x1="{p1x:.1f}" y1="{p1y:.1f}" x2="{p2x:.1f}" y2="{p2y:.1f}" stroke="#f8fafc" stroke-width="4" stroke-linecap="round"/>')
         mx, my = 0.5 * (p1x + p2x), 0.5 * (p1y + p2y)
-        lines.append(f'<rect x="{mx - 24:.1f}" y="{my - 11:.1f}" width="48" height="18" rx="4" fill="#0f172a" fill-opacity="0.85"/>')
-        lines.append(f'<text x="{mx:.1f}" y="{my + 3:.1f}" fill="#fde047" font-size="11" font-weight="600" text-anchor="middle">{w.length_m:.2f}m</text>')
+        lbl = f"{w.length_m:.2f}m · {w.plumb_mm_per_m:.0f}mm/m"
+        box_w = max(56.0, len(lbl) * 6.5)
+        lines.append(f'<rect x="{mx - box_w * 0.5:.1f}" y="{my - 11:.1f}" width="{box_w:.1f}" height="18" rx="4" fill="#0f172a" fill-opacity="0.88"/>')
+        lines.append(f'<text x="{mx:.1f}" y="{my + 3:.1f}" fill="#fde047" font-size="10" font-weight="600" text-anchor="middle">{lbl}</text>')
 
     # Barra de escala de 1.0 m
     sb_x1, sb_y = margin, canvas_h - 26.0
@@ -547,6 +561,8 @@ def analyze_room_geometry(
 
     walls_total_m = float(sum(w.length_m for w in walls))
     wall_area_m2 = float(hull_perim * ceiling_h)
+    max_plumb = max((w.plumb_mm_per_m for w in walls), default=0.0)
+    mean_plumb = float(np.mean([w.plumb_mm_per_m for w in walls])) if walls else 0.0
 
     svg_path = out_path / "floorplan.svg"
     dxf_path = out_path / "floorplan.dxf"
@@ -569,6 +585,8 @@ def analyze_room_geometry(
         floor_flatness_rms_mm=round(flat_rms, 2),
         floor_flatness_p95_mm=round(flat_p95, 2),
         floor_flatness_max_mm=round(flat_max, 2),
+        max_wall_plumb_mm_per_m=round(max_plumb, 1),
+        mean_wall_plumb_mm_per_m=round(mean_plumb, 1),
         floor_normal=[round(float(v), 5) for v in floor_normal],
         floor_offset_d=round(float(floor_d), 5),
         slice_band_m=[slice_band[0], slice_band[1]],

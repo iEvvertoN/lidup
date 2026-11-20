@@ -26,5 +26,8 @@ dev = [
 [project.scripts]
 lidup = "lidup.cli:main"
 
+[project.gui-scripts]
+lidup-studio = "lidup.studio:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

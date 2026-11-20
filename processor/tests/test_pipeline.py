@@ -479,3 +479,201 @@ def test_rust_core_bridge_loaded_and_accurate() -> None:
     assert dtm is not None and dtm.shape == (5, 5) and dtm[2, 2] > -0.8
 
 
+def test_studio_discovery_and_measure_parser(tmp_path: Path) -> None:
+    from lidup.studio import discover_workspace_items, parse_measure_output
+
+    bundle_dir = generate_synthetic_bundle(tmp_path / "2026-11-19_120000_setor", length_x_m=6.0, width_y_m=4.0)
+    out_dir = tmp_path / "out_120000"
+    out_dir.mkdir()
+    (out_dir / "object_textured.obj").write_text("# obj", encoding="utf-8")
+    (out_dir / "floorplan.svg").write_text("<svg/>", encoding="utf-8")
+
+    found = discover_workspace_items(tmp_path)
+    assert len(found["bundles"]) == 1
+    assert found["bundles"][0]["name"] == bundle_dir.name
+    assert found["bundles"][0]["frames"] > 0
+    assert len(found["outputs"]) == 1
+    assert found["outputs"][0]["artifacts"]["obj_uv"] is True
+    assert found["outputs"][0]["artifacts"]["svg"] is True
+
+    sample_out = (
+        "[lidup] Trecho 1 (#10 -> #25): 3D = 2.500 m (250.0 cm) | "
+        "Horiz = 2.400 m | dV = +0.700 m | Incl = 29.2% | (dX=+2.400, dY=+0.700, dZ=+0.000)\n"
+    )
+    rows = parse_measure_output(sample_out)
+    assert len(rows) == 1
+    assert rows[0]["dist_m"] == "2.500"
+    assert rows[0]["slope_pct"] == "29.2"
+
+
+def test_simulations_diff_drainage_and_clearance(tmp_path: Path) -> None:
+    from lidup.simulations import (
+        analyze_clearance_and_viewshed,
+        diff_point_clouds,
+        simulate_water_ponding,
+    )
+
+    gx, gz = np.meshgrid(np.linspace(0.0, 4.0, 45), np.linspace(0.0, 4.0, 45))
+    y_flat = np.zeros(gx.size)
+    before = np.column_stack([gx.ravel(), y_flat, gz.ravel()])
+
+    # Adiciona um bloco elevado (+0.15 m) no centro em "after"
+    after = before.copy()
+    bump = (after[:, 0] >= 1.5) & (after[:, 0] <= 2.5) & (after[:, 2] >= 1.5) & (after[:, 2] <= 2.5)
+    after[bump, 1] = 0.15
+    d_rep = diff_point_clouds(before, after, tmp_path / "diff_out", align=False, tol_mm=15.0)
+    assert d_rep.max_mm > 120.0
+    assert d_rep.added_pct > 2.0
+    assert Path(d_rep.outputs["diff_heatmap_ply"]).exists()
+
+    # Bacia de empoçamento de -6 cm no centro de um piso 4x4m
+    bowl = before.copy()
+    dist_c = np.hypot(bowl[:, 0] - 2.0, bowl[:, 2] - 2.0)
+    bowl[:, 1] = np.where(dist_c < 0.7, -0.06 * (1.0 - dist_c / 0.7), 0.0)
+    dr_rep = simulate_water_ponding(bowl, tmp_path / "drain_out", up_axis="y", cell_m=0.08)
+    assert dr_rep.max_depth_mm > 35.0
+    assert dr_rep.water_volume_liters > 5.0
+    assert Path(dr_rep.outputs["ponding_map_svg"]).exists()
+
+    # Sala 4x4m com parede divisória central contendo um pilar/obstáculo -> testa passagem + CFTV
+    obs_x = np.full(80, 2.0)
+    obs_z = np.concatenate([np.linspace(0.0, 1.2, 40), np.linspace(2.8, 4.0, 40)])
+    obs_pts = np.column_stack([obs_x, np.full(80, 1.0), obs_z])
+    room_obs = np.vstack([before, obs_pts])
+    cl_rep = analyze_clearance_and_viewshed(
+        room_obs,
+        tmp_path / "clr_out",
+        box_width_m=0.60,
+        box_depth_m=0.80,
+        box_height_m=1.50,
+        sensor_xy_m=(0.5, 2.0),
+        up_axis="y",
+        cell_m=0.10,
+    )
+    assert cl_rep.passable_pct > 30.0
+    assert 10.0 < cl_rep.viewshed_pct < 99.0
+    assert Path(cl_rep.outputs["clearance_map_svg"]).exists()
+    assert Path(cl_rep.outputs["viewshed_map_ply"]).exists()
+
+
+def test_ruler_ray_picking_and_segments() -> None:
+    import open3d as o3d
+    from lidup.ruler import compute_ruler_segments, pick_point_on_ray, raycast_geometry
+
+    pts = np.array([[0.0, 0.0, 2.0], [1.5, 0.0, 2.0], [1.5, 1.0, 2.0]], dtype=np.float64)
+    hit = pick_point_on_ray(pts, np.array([1.5, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
+    assert hit is not None and np.allclose(hit, [1.5, 0.0, 2.0])
+
+    # TriangleMesh raycast exact hit
+    box = o3d.geometry.TriangleMesh.create_box(width=1.0, height=1.0, depth=1.0)
+    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(box)
+    rc = o3d.t.geometry.RaycastingScene()
+    rc.add_triangles(t_mesh)
+    mesh_hit = raycast_geometry(box, np.array([0.5, 0.5, 3.0]), np.array([0.0, 0.0, -1.0]), raycaster=rc)
+    assert mesh_hit is not None and abs(mesh_hit[2] - 1.0) < 1e-4
+
+    segs = compute_ruler_segments(pts, up_axis="y")
+    assert len(segs) == 2
+    assert abs(segs[0]["dist_3d_m"] - 1.5) < 1e-4
+    assert abs(segs[1]["dv_up_m"] - 1.0) < 1e-4
+
+
+def test_fase2_plumbness_volume_and_reflective(tmp_path: Path) -> None:
+    from PIL import Image
+    from lidup.simulations import compute_object_or_pile_volume, detect_reflective_surfaces
+
+    # Cubo 1.0 x 1.0 x 0.5 m em cima de piso 4 x 4 m -> volume esperado ~ 0.50 m³
+    gx, gz = np.meshgrid(np.linspace(0.0, 4.0, 60), np.linspace(0.0, 4.0, 60))
+    pts_y = np.zeros(gx.size)
+    in_pile = (gx.ravel() >= 1.5) & (gx.ravel() < 2.5) & (gz.ravel() >= 1.5) & (gz.ravel() < 2.5)
+    pts_y[in_pile] = 0.50
+    pile_pts = np.column_stack([gx.ravel(), pts_y, gz.ravel()])
+
+    v_rep = compute_object_or_pile_volume(pile_pts, tmp_path / "vol_out", up_axis="y", cell_m=0.05)
+    assert abs(v_rep.volume_m3 - 0.50) < 0.12
+    assert abs(v_rep.max_height_m - 0.50) < 0.05
+    assert Path(v_rep.outputs["volume_heatmap_ply"]).exists()
+
+    # Detector de vidros/espelhos via confidence == 0 no bundle
+    bdir = generate_synthetic_bundle(tmp_path / "glass_bundle", length_x_m=6.0, width_y_m=4.0)
+    conf_files = sorted((bdir / "confidence").glob("*.png"))
+    arr = np.asarray(Image.open(conf_files[0]), dtype=np.uint8).copy()
+    arr[:40, :40] = 0
+    Image.fromarray(arr).save(conf_files[0])
+
+    r_rep = detect_reflective_surfaces(bdir, tmp_path / "ref_out", frame_stride=1)
+    assert r_rep.reflective_point_count >= 100
+    assert Path(r_rep.outputs["reflective_zones_ply"]).exists()
+
+
+def test_pixel_ray_and_camera_navigation() -> None:
+    from lidup.ruler import compute_pixel_ray, preset_camera_pose, step_camera_pose
+
+    class _FakeCam:
+        def unproject(self, x: float, y: float, z: float, w: float, h: float) -> np.ndarray:
+            if z >= 0.99:
+                return np.array([float("nan"), float("nan"), float("-inf")])
+            nx = (x - w * 0.5) / max(w * 0.5, 1.0)
+            ny = -(y - h * 0.5) / max(h * 0.5, 1.0)
+            depth = 0.1 + 9.9 * z
+            return np.array([nx * depth * 0.5, ny * depth * 0.5, 5.0 - depth])
+
+    ray = compute_pixel_ray(_FakeCam(), 400.0, 300.0, 800.0, 600.0)
+    assert ray is not None
+    orig, direction = ray
+    assert np.all(np.isfinite(orig))
+    assert np.allclose(direction, [0.0, 0.0, -1.0], atol=1e-6)
+
+    vm = np.eye(4, dtype=np.float64)
+    vm[:3, 3] = [0.0, 0.0, -4.0]  # eye = [0, 0, 4], looking -Z
+    c_fwd, e_fwd, _ = step_camera_pose(vm, "forward", step_m=0.5, up_axis="y")
+    assert np.allclose(e_fwd, [0.0, 0.0, 3.5], atol=1e-6)
+    assert c_fwd[2] < e_fwd[2]
+
+    _, e_right, _ = step_camera_pose(vm, "right", step_m=0.5, up_axis="y")
+    assert np.allclose(e_right, [0.5, 0.0, 4.0], atol=1e-6)
+
+    _, e_up, _ = step_camera_pose(vm, "up", step_m=0.5, up_axis="y")
+    assert np.allclose(e_up, [0.0, 0.5, 4.0], atol=1e-6)
+
+    c_yaw, e_yaw, _ = step_camera_pose(vm, "yaw_right", turn_rad=0.25, pivot_dist=2.0, up_axis="y")
+    assert np.allclose(e_yaw, [0.0, 0.0, 4.0], atol=1e-6)
+    assert (c_yaw - e_yaw)[0] > 0.0
+
+    ctr, eye_top, up_top = preset_camera_pose([-1.0, 0.0, -1.0], [1.0, 2.0, 1.0], "top", up_axis="y")
+    assert np.allclose(ctr, [0.0, 1.0, 0.0])
+    assert eye_top[1] > ctr[1]
+    assert abs(float(np.dot(up_top, [0.0, 1.0, 0.0]))) < 0.1
+
+
+def test_lidar_only_bundle_without_images(tmp_path: Path) -> None:
+    import csv
+    import shutil
+    from lidup.bundle import load_bundle, reconstruct_lidar_point_cloud, reconstruct_tsdf_mesh
+
+    bdir = generate_synthetic_bundle(tmp_path / "lidar_only_bundle", length_x_m=6.0, width_y_m=4.0)
+    shutil.rmtree(bdir / "images")
+
+    frames_path = bdir / "frames.csv"
+    rows = list(csv.DictReader(frames_path.open("r", encoding="utf-8", newline="")))
+    fieldnames = list(rows[0].keys())
+    for r in rows:
+        r["image_file"] = ""
+    with frames_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+
+    bundle = load_bundle(bdir)
+    pcd = reconstruct_lidar_point_cloud(bundle, min_confidence=2, voxel_size_m=0.04, hires_color=False)
+    assert len(pcd.points) > 100
+
+    _, mesh = reconstruct_tsdf_mesh(bundle, min_confidence=2, tsdf_voxel_m=0.04, refine_poses=False, hires_color=False)
+    assert len(mesh.vertices) > 100
+
+
+
+
+
+
+

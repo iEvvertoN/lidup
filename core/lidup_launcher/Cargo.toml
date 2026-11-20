@@ -1,0 +1,9 @@
+[package]
+name = "lidup_launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-console Windows GUI launcher for LidUp Studio"
+
+[[bin]]
+name = "LidUpStudio"
+path = "src/main.rs"

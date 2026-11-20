@@ -1,6 +1,7 @@
 mod capture;
 mod depth;
 mod photogrammetry;
+mod simulations;
 mod terrain;
 
 use std::slice;
@@ -14,9 +15,10 @@ use photogrammetry::{
     colorize_hires_frame_u8_impl, mvs_sweep_impl, resize_rgb_u8_to_f32_impl,
     warp_rgb_to_depth_impl, NeighborSlice,
 };
+use simulations::{clearance_and_viewshed_impl, priority_flood_ponding_impl};
 use terrain::csf_cloth_simulate_impl;
 
-const ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 3;
 
 #[no_mangle]
 pub extern "C" fn lidup_core_abi_version() -> u32 {
@@ -557,9 +559,97 @@ pub unsafe extern "C" fn lidup_csf_cloth_filter_f64(
     0
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn lidup_priority_flood_ponding_f64(
+    z_grid_f64: *const f64,
+    valid_u8: *const u8,
+    nx: i32,
+    ny: i32,
+    out_water_depth_m_f64: *mut f64,
+) -> i32 {
+    if z_grid_f64.is_null() || valid_u8.is_null() || out_water_depth_m_f64.is_null() || nx <= 0 || ny <= 0 {
+        return -1;
+    }
+    let n = (nx as usize) * (ny as usize);
+    priority_flood_ponding_impl(
+        unsafe { slice::from_raw_parts(z_grid_f64, n) },
+        unsafe { slice::from_raw_parts(valid_u8, n) },
+        nx as usize,
+        ny as usize,
+        unsafe { slice::from_raw_parts_mut(out_water_depth_m_f64, n) },
+    );
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lidup_clearance_and_viewshed_u8(
+    occ_u8: *const u8,
+    domain_u8: *const u8,
+    nx: i32,
+    ny: i32,
+    cell_m: f64,
+    half_w_m: f64,
+    half_d_m: f64,
+    sensor_ix: i32,
+    sensor_iy: i32,
+    out_passable_u8: *mut u8,
+    out_visible_u8: *mut u8,
+) -> i32 {
+    if occ_u8.is_null()
+        || domain_u8.is_null()
+        || out_passable_u8.is_null()
+        || out_visible_u8.is_null()
+        || nx <= 0
+        || ny <= 0
+        || cell_m <= 0.0
+    {
+        return -1;
+    }
+    let n = (nx as usize) * (ny as usize);
+    clearance_and_viewshed_impl(
+        unsafe { slice::from_raw_parts(occ_u8, n) },
+        unsafe { slice::from_raw_parts(domain_u8, n) },
+        nx as usize,
+        ny as usize,
+        cell_m,
+        half_w_m,
+        half_d_m,
+        sensor_ix as isize,
+        sensor_iy as isize,
+        unsafe { slice::from_raw_parts_mut(out_passable_u8, n) },
+        unsafe { slice::from_raw_parts_mut(out_visible_u8, n) },
+    );
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ponding_and_clearance_and_viewshed() {
+        let mut z = vec![0.10f64; 7 * 7];
+        z[3 * 7 + 3] = 0.02;
+        z[3 * 7 + 4] = 0.05;
+        let valid = vec![1u8; 7 * 7];
+        let mut water = vec![0.0f64; 7 * 7];
+        priority_flood_ponding_impl(&z, &valid, 7, 7, &mut water);
+        assert!((water[3 * 7 + 3] - 0.08).abs() < 1e-6);
+        assert!((water[3 * 7 + 4] - 0.05).abs() < 1e-6);
+        assert!(water[0].abs() < 1e-9);
+
+        let domain = vec![1u8; 9 * 9];
+        let mut occ = vec![0u8; 9 * 9];
+        for y in 0..9 {
+            occ[y * 9 + 4] = if y == 4 { 0 } else { 1 }; // narrow doorway at x=4,y=4
+        }
+        let mut pass = vec![0u8; 9 * 9];
+        let mut vis = vec![0u8; 9 * 9];
+        clearance_and_viewshed_impl(&occ, &domain, 9, 9, 0.25, 0.20, 0.20, 1, 4, &mut pass, &mut vis);
+        assert_eq!(pass[4 * 9 + 1], 1);
+        assert_eq!(vis[4 * 9 + 7], 1); // visible straight through doorway
+        assert_eq!(vis[0 * 9 + 7], 0); // occluded behind wall
+    }
 
     #[test]
     fn test_depth_float32_to_mm_u16_and_center() {
